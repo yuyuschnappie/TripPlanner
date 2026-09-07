@@ -1,0 +1,996 @@
+<!DOCTYPE html>
+<html lang="zh-TW">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>一起出遊 🏕️</title>
+  <script src="https://cdn.tailwindcss.com"></script>
+  <link href="https://fonts.googleapis.com/css2?family=Noto+Sans+TC:wght@400;500;700&display=swap" rel="stylesheet">
+  <style>
+    * { font-family: 'Noto Sans TC', system-ui, sans-serif; }
+    body { background: linear-gradient(160deg,#f0fdf4 0%,#ecfdf5 100%); min-height:100vh; }
+    .spin  { animation: spin  1s linear   infinite; }
+    .slide { animation: slide .25s ease; }
+    @keyframes spin  { to { transform: rotate(360deg); } }
+    @keyframes slide { from { opacity:0; transform:translateY(8px); } to { opacity:1; transform:none; } }
+    input[type=number]::-webkit-inner-spin-button,
+    input[type=number]::-webkit-outer-spin-button { -webkit-appearance:none; margin:0; }
+    ::-webkit-scrollbar { width:3px; }
+    ::-webkit-scrollbar-thumb { background:#86efac; border-radius:2px; }
+    body { overflow-x: hidden; }
+    @media (max-width: 640px) {
+      /* 避免 iOS 聚焦 16px 以下輸入框時自動放大，造成版面跳動。 */
+      input, select { font-size: 16px !important; }
+    }
+  
+    /* 隱藏原生時間選擇器的時鐘 icon */
+    input[type="time"]::-webkit-calendar-picker-indicator {
+      display: none;
+      -webkit-appearance: none;
+    }
+    input[type="time"] {
+      cursor: pointer;
+    }
+
+    /* 修正 iOS 原生時間選擇器的文字對齊問題 */
+    input[type="time"]::-webkit-date-and-time-value {
+      text-align: left;
+    }
+</style>
+  <script src="https://cdn.jsdelivr.net/npm/sortablejs@1.15.2/Sortable.min.js"></script>
+</head>
+<body>
+<div id="app" class="max-w-lg mx-auto px-4 pb-28 min-h-screen"></div>
+<script>
+// ── utils ──────────────────────────────────────────────────────────
+const $e = id => document.getElementById(id);
+const fmt = n => '$' + (+n || 0).toLocaleString('zh-TW', {maximumFractionDigits:2});
+const escapeHtml = value => String(value ?? '').replace(/[&<>"']/g, ch => ({
+  '&':'&amp;', '<':'&lt;', '>':'&gt;', '"':'&quot;', "'":'&#39;'
+}[ch]));
+
+// 正式部署前只需由維護者填入一次。一般使用者不需要、也不應看見 API 設定。
+// Web App URL 不是祕密；請搭配後端的輸入驗證與使用量監控。
+const DEFAULT_API_URL = 'https://script.google.com/macros/s/AKfycbygKTfIk0pqval3Df8Y2Xj_HhJMpYCiu_FvZzyEQWEdXSoaEYhOoV3Ga-_yLqwSZlzk/exec';
+const DEV_SETTINGS = new URLSearchParams(location.search).get('setup') === '1';
+const COLORS = ['from-green-400 to-emerald-500','from-blue-400 to-cyan-500',
+  'from-purple-400 to-violet-500','from-amber-400 to-orange-500','from-pink-400 to-rose-500'];
+const getColor = name => COLORS[(name||'?').charCodeAt(0) % COLORS.length];
+
+function toast(msg, type) {
+  const c = {ok:'bg-green-600',err:'bg-red-600',info:'bg-gray-800'};
+  const el = document.createElement('div');
+  el.className = 'fixed bottom-8 left-1/2 -translate-x-1/2 '+(c[type]||c.info)+' text-white px-5 py-2.5 rounded-full text-sm z-50 shadow-xl';
+  el.textContent = msg;
+  document.body.appendChild(el);
+  setTimeout(() => { el.style.transition='opacity .3s'; el.style.opacity=0; setTimeout(()=>el.remove(),300); }, 2500);
+}
+
+// ── state ──────────────────────────────────────────────────────────
+const S = {
+  page:  'home',
+  apiUrl: DEV_SETTINGS ? localStorage.getItem('agy_trip_api') || DEFAULT_API_URL : DEFAULT_API_URL,
+  actId:  new URLSearchParams(location.search).get('id'),
+  act: null, user: null, tab: 'schedule', busy: false, syncing: 0,
+  expandedItem: null, autoRefreshTimer: null, scheduleDateDraft: null,
+  draft: { name:'', members:[], items:[] }
+};
+
+// ── api ────────────────────────────────────────────────────────────
+async function apiGet(params) {
+  if (!S.apiUrl) throw new Error('請先設定 API URL');
+  const url = new URL(S.apiUrl);
+  Object.entries(params).forEach(([k,v]) => url.searchParams.set(k,v));
+  const r = await fetch(url.toString());
+  const d = await r.json();
+  if (d.error) throw new Error(d.error);
+  return d;
+}
+async function apiPost(body) {
+  if (!S.apiUrl) throw new Error('請先設定 API URL');
+  // 不指定自訂 Header，瀏覽器會以 text/plain 發送，屬於 CORS simple request；
+  // 也避免將行程 JSON 塞進 GET URL 而碰到網址長度上限。
+  const r = await fetch(S.apiUrl, { method: 'POST', body: JSON.stringify(body) });
+  const d = await r.json();
+  if (d.error) throw new Error(d.error);
+  return d;
+}
+
+async function loadAct(id, isSilent = false) {
+  if (!isSilent) { S.busy = true; render(); }
+  try {
+    const d = await apiGet({ action: 'getActivity', id });
+    const newAct = d.activity;
+    
+    // BUG FIX 4: 如果正在寫入資料，或剛寫完不到 15 秒（避免讀到延遲的舊資料），暫停背景更新
+    if (S.syncing > 0 || (S.lastWriteTime && Date.now() - S.lastWriteTime < 15000)) {
+      if (!isSilent) { S.busy = false; render(); }
+      return;
+    }
+
+    // Check if anything changed to avoid UI flashing
+    if (S.act) {
+      const oldStr = JSON.stringify({ items: S.act.items, schedule: S.act.schedule });
+      const newStr = JSON.stringify({ items: newAct.items, schedule: newAct.schedule });
+      if (oldStr === newStr) {
+        if (!isSilent) { S.busy = false; render(); }
+        return; // No changes, DO NOT render if silent
+      }
+    }
+    
+    S.act = newAct;
+    S.busy = false;
+    render();
+  } catch (e) { 
+    if(!isSilent) toast('❌ ' + e.message, 'err'); 
+    S.busy = false;
+    if(!isSilent) render();
+  }
+}
+
+// Start auto refresh
+function startAutoRefresh() {
+  if (S.autoRefreshTimer) clearInterval(S.autoRefreshTimer);
+  S.autoRefreshTimer = setInterval(() => {
+    if (S.actId && S.page === 'activity') {
+      // 暫停更新：如果使用者正在輸入，不要拉取資料以免覆蓋正在打字的內容
+      const active = document.activeElement;
+      if (active && (active.tagName === 'INPUT' || active.tagName === 'SELECT')) return;
+      
+      loadAct(S.actId, true);
+    }
+  }, 30000);
+}
+startAutoRefresh();
+
+
+async function saveSchedule() {
+  S.syncing = (S.syncing || 0) + 1; S.lastWriteTime = Date.now(); // BUG FIX 4: 行程儲存時鎖定同步，避免背景刷新覆蓋
+  try {
+    await apiPost({ action: 'updateSchedule', activityId: S.actId, schedule: S.act.schedule });
+  } catch (e) {
+    // BUG FIX 2: 印出詳細錯誤訊息，並在 404 時不覆蓋畫面
+    toast('行程儲存失敗: ' + e.message, 'err');
+  } finally {
+    S.syncing--; S.lastWriteTime = Date.now();
+  }
+}
+
+async function updateItemRemote(itemId, name, claimers, payer, amount, sharers, shouldRender = true) {
+  const item = S.act?.items?.find(i => String(i.id) === String(itemId));
+  if (item) { 
+    if(name) item.name=name;
+    item.claimers=claimers; item.payer=payer; item.amount=+amount||0; 
+    item.sharers=sharers; 
+    // 文字欄／金額欄在手機上輸入時不可重建整張卡片，否則焦點與鍵盤會被中斷。
+    if (shouldRender) render();
+  }
+  S.syncing = (S.syncing || 0) + 1; S.lastWriteTime = Date.now(); 
+  let failed = false;
+  try { 
+    await apiPost({action:'updateItem',activityId:S.actId,itemId,name:name||item.name,claimers,payer,amount:+amount||0, sharers: sharers||null}); 
+  }
+  catch(e) { toast('❌ 儲存失敗：'+e.message,'err'); failed = true; }
+  finally {
+    S.syncing--; S.lastWriteTime = Date.now();
+    if (failed) await loadAct(S.actId);
+  }
+}
+
+// ── settlement ─────────────────────────────────────────────────────
+function calcSettlement() {
+  if (!S.act) return null;
+  const {members,items} = S.act;
+  const paidCents = {}; const balCents = {};
+  members.forEach(m => { paidCents[m]=0; balCents[m]=0; });
+  let totalCents = 0;
+  
+  items.forEach(it => {
+    if (it.payer && it.amount > 0) {
+      const amountCents = Math.round(Number(it.amount) * 100);
+      paidCents[it.payer] = (paidCents[it.payer]||0) + amountCents;
+      balCents[it.payer] = (balCents[it.payer]||0) + amountCents;
+      totalCents += amountCents;
+
+      const sh = it.sharers || members;
+      if (sh.length > 0) {
+        // 以「分」運算，無法整除的餘額依分攤人目前順序各加一分，
+        // 確保建議匯款加總永遠等於原始金額。
+        const base = Math.floor(amountCents / sh.length);
+        const remainder = amountCents % sh.length;
+        sh.forEach((m, index) => { balCents[m] = (balCents[m]||0) - base - (index < remainder ? 1 : 0); });
+      }
+    }
+  });
+  const creditors = members.filter(m=>balCents[m]>0).map(m=>({name:m,amt:balCents[m]})).sort((a,b)=>b.amt-a.amt);
+  const debtors   = members.filter(m=>balCents[m]<0).map(m=>({name:m,amt:-balCents[m]})).sort((a,b)=>b.amt-a.amt);
+  const txns = []; let ci=0,di=0;
+  while (ci<creditors.length && di<debtors.length) {
+    const amt = Math.min(creditors[ci].amt, debtors[di].amt);
+    if (amt>0) txns.push({from:debtors[di].name, to:creditors[ci].name, amt:amt/100});
+    creditors[ci].amt -= amt; debtors[di].amt -= amt;
+    if (creditors[ci].amt === 0) ci++;
+    if (debtors[di].amt === 0) di++;
+  }
+  const paid = Object.fromEntries(members.map(m => [m, paidCents[m] / 100]));
+  const bal = Object.fromEntries(members.map(m => [m, balCents[m] / 100]));
+  const cost = Object.fromEntries(members.map(m => [m, (paidCents[m] - balCents[m]) / 100]));
+  return {total: totalCents / 100, paid, bal, cost, txns};
+}
+
+// ── render ─────────────────────────────────────────────────────────
+function render() {
+  const app = $e('app'); if (!app) return;
+  if (S.busy && !S.act) { app.innerHTML = renderLoading(); return; }
+  const pages = {home:renderHome, setup:renderSetup, create:renderCreate, activity:renderActivity};
+  app.innerHTML = (pages[S.page] || renderHome)();
+  bind();
+}
+
+function renderLoading() {
+  return '<div class="flex flex-col items-center justify-center min-h-screen text-center"><div class="text-6xl mb-4 animate-bounce">🏕️</div><p class="text-gray-400">載入中...</p></div>';
+}
+
+// ── home page ──────────────────────────────────────────────────────
+function renderHome() {
+  const apiWarn = !S.apiUrl && DEV_SETTINGS
+    ? '<div class="mt-8 p-4 bg-amber-50 border border-amber-200 rounded-xl text-sm text-amber-700 flex gap-3"><span>⚠️</span><div>尚未設定 API 連線<br><button id="btn-go-setup" class="font-semibold underline mt-1">立即設定 →</button></div></div>'
+    : '';
+  return `<div class="pt-16 pb-8 slide">
+  <div class="text-center mb-12">
+    <div class="text-7xl mb-3">🏕️</div>
+    <h1 class="text-3xl font-bold text-gray-800 mb-1">一起出遊</h1>
+    <p class="text-gray-400 text-sm">品項認領 ✦ 金流結算</p>
+  </div>
+  <div class="space-y-4">
+    <button id="btn-create" class="w-full py-4 bg-green-500 hover:bg-green-600 active:bg-green-700 text-white text-lg font-bold rounded-2xl shadow-md active:scale-95 transition-all">✨ 建立新活動</button>
+    <div class="flex items-center gap-3 text-gray-300 text-xs">
+      <div class="h-px flex-1 bg-gray-200"></div>或加入現有活動<div class="h-px flex-1 bg-gray-200"></div>
+    </div>
+    <div class="flex gap-2">
+      <input id="join-input" type="text" placeholder="輸入活動代碼" class="flex-1 px-4 py-3 border-2 border-gray-100 rounded-xl text-gray-700 focus:outline-none focus:border-green-400 bg-white">
+      <button id="btn-join" class="px-5 py-3 bg-gray-800 text-white font-medium rounded-xl active:scale-95 transition-all">加入</button>
+    </div>
+  </div>
+  ${apiWarn}
+  ${DEV_SETTINGS ? `<div class="mt-8 text-center">
+    <button id="btn-settings" class="text-xs text-gray-300 hover:text-gray-500 transition-colors">⚙️ API 設定</button>
+  </div>` : ''}
+</div>`;
+}
+
+// ── setup page ─────────────────────────────────────────────────────
+function renderSetup() {
+  return `<div class="pt-8 slide">
+  <button id="btn-back" class="text-green-600 mb-6 text-sm font-medium flex items-center gap-1">← 返回首頁</button>
+  <h2 class="text-2xl font-bold text-gray-800 mb-1">⚙️ API 設定</h2>
+  <p class="text-gray-400 text-sm mb-6">貼上你部署的 Google Apps Script Web App URL</p>
+  <div class="space-y-3">
+    <input id="api-input" type="url" value="${escapeHtml(S.apiUrl)}" placeholder="https://script.google.com/macros/s/.../exec"
+      class="w-full px-4 py-3 border-2 border-gray-100 rounded-xl text-sm focus:outline-none focus:border-green-400 bg-white">
+    <button id="btn-test" class="w-full py-3 border-2 border-green-500 text-green-600 font-medium rounded-xl active:scale-95 transition-all">🔍 測試連線</button>
+    <button id="btn-save-api" class="w-full py-3 bg-green-500 text-white font-bold rounded-xl active:scale-95 transition-all">儲存設定</button>
+  </div>
+  <div id="test-result" class="mt-3"></div>
+  <div class="mt-6 p-4 bg-blue-50 border border-blue-100 rounded-xl text-xs text-blue-700 leading-relaxed">
+    <p class="font-semibold mb-2">📖 如何取得 URL？</p>
+    <ol class="space-y-1">
+      <li>1. 到 <a href="https://script.google.com" target="_blank" class="underline">script.google.com</a> 建立新專案</li>
+      <li>2. 將 <strong>Code.gs</strong> 的內容完整貼入</li>
+      <li>3. 點「部署」→「新增部署作業」→「網頁應用程式」</li>
+      <li>4. 執行身分：<strong>我</strong>，存取權：<strong>所有人</strong></li>
+      <li>5. 授權後複製 URL 貼到上方輸入框</li>
+    </ol>
+  </div>
+</div>`;
+}
+
+// ── create page ────────────────────────────────────────────────────
+function renderCreate() {
+  return `<div class="pt-8 slide">
+  <button id="btn-back" class="text-green-600 mb-6 text-sm font-medium flex items-center gap-1">← 返回首頁</button>
+  <h2 class="text-2xl font-bold text-gray-800 mb-6">✨ 建立新活動</h2>
+  <div class="space-y-6">
+    <div>
+      <label class="text-sm font-medium text-gray-600 block mb-1.5">活動代碼 (選填)</label>
+      <input id="create-id" type="text" maxlength="24" autocapitalize="characters" autocorrect="off" spellcheck="false"
+        placeholder="3～24 位英文或數字，留空自動產生"
+        class="w-full px-4 py-3 border-2 border-gray-100 rounded-xl focus:outline-none focus:border-green-400 bg-white">
+      <p class="mt-1.5 text-xs text-gray-400">會自動轉為大寫，建立後不可更改。</p>
+    </div>
+    <div>
+      <label class="text-sm font-medium text-gray-600 block mb-1.5">活動名稱 *</label>
+      <input id="act-name" type="text" value="${escapeHtml(S.draft.name)}" placeholder="例：陽明山烤肉趴 🍖"
+        class="w-full px-4 py-3 border-2 border-gray-100 rounded-xl focus:outline-none focus:border-green-400 bg-white">
+    </div>
+    <div>
+      <label class="text-sm font-medium text-gray-600 block mb-1.5">成員名單 *</label>
+      <div class="flex gap-2 mb-2 min-w-0">
+        <input id="member-input" type="text" placeholder="輸入名字，按 Enter 新增"
+          class="flex-1 min-w-0 w-0 px-4 py-3 border-2 border-gray-100 rounded-xl focus:outline-none focus:border-green-400 bg-white text-sm">
+        <button id="btn-add-member" class="flex-none shrink-0 whitespace-nowrap px-4 py-3 bg-green-100 text-green-700 font-semibold rounded-xl active:scale-95 text-sm">新增</button>
+      </div>
+      <div id="members-wrap" class="flex flex-wrap gap-2">${S.draft.members.map(memberChip).join('')}</div>
+    </div>
+    <div>
+      <label class="text-sm font-medium text-gray-600 block mb-1.5">品項清單（選填）</label>
+      <div class="flex gap-2 mb-2 min-w-0">
+        <input id="item-input" type="text" placeholder="輸入品項，按 Enter 新增"
+          class="flex-1 min-w-0 w-0 px-4 py-3 border-2 border-gray-100 rounded-xl focus:outline-none focus:border-green-400 bg-white text-sm">
+        <button id="btn-add-item-c" class="flex-none shrink-0 whitespace-nowrap px-4 py-3 bg-green-100 text-green-700 font-semibold rounded-xl active:scale-95 text-sm">新增</button>
+      </div>
+      <div id="items-wrap" class="space-y-2">${S.draft.items.map(itemRow).join('')}</div>
+    </div>
+    <button id="btn-submit" class="w-full py-4 bg-green-500 hover:bg-green-600 text-white text-lg font-bold rounded-2xl shadow-md active:scale-95 transition-all">🚀 建立活動</button>
+  </div>
+</div>`;
+}
+
+function memberChip(m, i) {
+  return `<span class="flex items-center gap-1.5 px-3 py-1.5 bg-green-100 text-green-700 rounded-full text-sm font-medium">${escapeHtml(m)}<button class="rm-member text-green-400 hover:text-red-500 transition-colors" data-i="${i}">✕</button></span>`;
+}
+function itemRow(it, i) {
+  return `<div class="flex items-center justify-between px-4 py-3 bg-white rounded-xl border border-gray-100 text-sm"><span class="text-gray-700">${escapeHtml(it)}</span><button class="rm-item text-gray-300 hover:text-red-400 transition-colors" data-i="${i}">🗑️</button></div>`;
+}
+
+// ── activity page ──────────────────────────────────────────────────
+function renderActivity() {
+  if (!S.act) {
+    return `<div class="pt-20 text-center slide"><div class="text-6xl mb-4">🔍</div><p class="text-gray-400 mb-4">${S.busy?'載入中...':'找不到此活動'}</p><button id="btn-back" class="text-green-600 underline text-sm">回首頁</button></div>`;
+  }
+  const userAvatar = S.user
+    ? `<span class="w-7 h-7 rounded-full bg-gradient-to-br ${getColor(S.user)} flex items-center justify-center text-white text-xs font-bold flex-shrink-0">${escapeHtml(S.user.charAt(0))}</span>`
+    : '';
+  const memberOptions = S.act.members.map(m => `<option value="${escapeHtml(m)}"${S.user===m?' selected':''}>${escapeHtml(m)}</option>`).join('');
+  const itemsTab   = S.tab==='items'      ? 'border-green-500 text-green-600' : 'border-transparent text-gray-400';
+  const settleTab  = S.tab==='settlement' ? 'border-green-500 text-green-600' : 'border-transparent text-gray-400';
+
+  return `<div class="slide">
+  <div class="sticky top-0 z-20 bg-green-50/95 backdrop-blur-sm pt-6 pb-2">
+    <div class="flex items-start justify-between mb-3">
+      <div>
+        <h1 class="text-xl font-bold text-gray-800 leading-tight">${escapeHtml(S.act.name)}</h1>
+        <p class="text-xs text-gray-400 font-mono mt-0.5">代碼：${escapeHtml(S.act.id)}</p>
+      </div>
+      <button id="btn-share" class="flex-shrink-0 ml-2 px-3 py-1.5 bg-green-500 text-white rounded-lg text-xs font-semibold active:scale-95">🔗 分享</button>
+    </div>
+    <div class="flex items-center gap-2 mb-3 bg-white rounded-xl px-3 py-2 border border-gray-100 shadow-sm">
+      <span class="text-xs text-gray-400 flex-shrink-0">我是</span>
+      <select id="user-sel" class="flex-1 text-sm font-semibold text-gray-700 bg-transparent focus:outline-none">
+        <option value="">請選擇你的名字</option>
+        ${memberOptions}
+      </select>
+      ${userAvatar}
+    </div>
+    <div class="flex border-b border-gray-200">
+      <button id="tab-schedule" class="flex-1 py-2.5 text-sm font-semibold border-b-2 transition-colors ${S.tab==='schedule'?'border-green-500 text-green-600':'border-transparent text-gray-400'}">📅 行程表</button>
+      <button id="tab-items"    class="flex-1 py-2.5 text-sm font-semibold border-b-2 transition-colors ${S.tab==='items'?'border-green-500 text-green-600':'border-transparent text-gray-400'}">📋 品項清單</button>
+      <button id="tab-settle"   class="flex-1 py-2.5 text-sm font-semibold border-b-2 transition-colors ${S.tab==='settlement'?'border-green-500 text-green-600':'border-transparent text-gray-400'}">💰 金流結算</button>
+    </div>
+  </div>
+  ${S.tab === 'schedule' ? renderSchedule() : S.tab === 'items' ? renderItems() : renderSettle()}
+  <div class="fixed bottom-8 right-4 z-30">
+    <button id="btn-refresh" class="w-12 h-12 bg-white shadow-lg rounded-full flex items-center justify-center text-xl active:scale-90 transition-all${S.busy?' spin':''}">🔄</button>
+  </div>
+</div>`;
+}
+
+
+function renderSchedule() {
+  if (!S.act.schedule) S.act.schedule = [];
+  const entries = S.act.schedule
+    .map((s, idx) => ({ s, idx }))
+    .sort((a, b) => {
+      const dateCompare = (a.s.date || '9999-99-99').localeCompare(b.s.date || '9999-99-99');
+      // 同一時間保留原本輸入順序，避免不同格式（09:30／0930）被字串排序打亂。
+      return dateCompare || scheduleTimeValue(a.s.time) - scheduleTimeValue(b.s.time) || a.idx - b.idx;
+    });
+  const groups = entries.reduce((result, entry) => {
+    const date = entry.s.date || '';
+    (result[date] ||= []).push(entry);
+    return result;
+  }, {});
+  const undatedCount = groups['']?.length || 0;
+  const timelineHtml = Object.entries(groups).map(([date, group]) => `
+    <section class="mb-5">
+      <div class="-mx-1 mb-2 px-1 py-2 flex items-center gap-2">
+        <span class="w-2.5 h-2.5 rounded-full bg-green-500"></span>
+        <h2 class="text-sm font-bold text-green-800">${date ? formatScheduleDate(date) : '尚未設定日期'}</h2>
+        <span class="text-xs text-green-600/70">${group.length} 項</span>
+        ${date
+          ? `<button class="sch-add-on-date ml-auto text-xs font-semibold text-green-600 hover:text-green-700 px-2 py-1 rounded-lg hover:bg-green-100" data-date="${escapeHtml(date)}">＋ 新增行程</button>`
+          : `<input type="date" aria-label="為舊行程設定日期" class="sch-assign-undated ml-auto text-xs px-2 py-1 border border-amber-300 rounded-lg bg-white" value="${S.scheduleDateDraft || localDateValue()}">`}
+      </div>
+      <div class="space-y-2">
+        ${group.map(({s, idx}) => renderScheduleCard(s, idx)).join('')}
+      </div>
+    </section>`).join('');
+  return `<div class="pt-3 pb-28">
+    ${undatedCount ? `<div class="mb-4 p-3 bg-amber-50 border border-amber-200 rounded-xl text-xs text-amber-700">⚠️ 有 <b>${undatedCount}</b> 筆舊行程尚未設定日期，請補上日期以顯示在時間軸中。</div>` : ''}
+    <div class="mb-4" id="sch-list">${timelineHtml}</div>
+    <div class="flex gap-2 min-w-0">
+      <input id="new-schedule-date" type="date" aria-label="新增日期" value="${S.scheduleDateDraft || nextScheduleDate()}"
+        class="flex-1 min-w-0 w-0 px-3 py-3 border-2 border-dashed border-green-200 rounded-xl text-sm text-gray-600 focus:outline-none focus:border-green-400 bg-white/60">
+      <button id="btn-add-sch" class="flex-none shrink-0 whitespace-nowrap px-4 py-3 border-2 border-dashed border-green-200 text-green-600 rounded-xl text-sm font-semibold hover:bg-green-50 active:scale-95 transition-all">＋ 新增日期</button>
+    </div>
+  </div>`;
+}
+
+function formatScheduleDate(date) {
+  const parsed = new Date(date + 'T00:00:00');
+  return parsed.toLocaleDateString('zh-TW', { month:'long', day:'numeric', weekday:'short' });
+}
+
+function localDateValue() {
+  const now = new Date();
+  const local = new Date(now.getTime() - now.getTimezoneOffset() * 60000);
+  return local.toISOString().slice(0, 10);
+}
+
+function nextScheduleDate() {
+  const dates = S.act.schedule.map(s => s.date).filter(Boolean).sort();
+  if (!dates.length) return localDateValue();
+  const [year, month, day] = dates[dates.length - 1].split('-').map(Number);
+  const next = new Date(year, month - 1, day + 1);
+  const local = new Date(next.getTime() - next.getTimezoneOffset() * 60000);
+  return local.toISOString().slice(0, 10);
+}
+
+function scheduleTimeValue(time) {
+  const value = String(time || '').trim();
+  let hour, minute;
+  const colon = value.match(/^(\d{1,2}):(\d{2})$/);
+  const compact = value.match(/^\d{3,4}$/);
+  const hourOnly = value.match(/^\d{1,2}$/);
+  if (colon) {
+    hour = Number(colon[1]); minute = Number(colon[2]);
+  } else if (compact) {
+    hour = Number(value.slice(0, -2)); minute = Number(value.slice(-2));
+  } else if (hourOnly) {
+    hour = Number(value); minute = 0;
+  } else {
+    return Number.MAX_SAFE_INTEGER;
+  }
+  return hour >= 0 && hour < 24 && minute >= 0 && minute < 60
+    ? hour * 60 + minute : Number.MAX_SAFE_INTEGER;
+}
+
+function renderScheduleCard(s, idx) {
+  const externalUrl = safeExternalUrl(s.locationUrl);
+  return `<div class="bg-white p-3 rounded-xl border border-gray-100 flex gap-3 shadow-sm relative group">
+    <div class="flex flex-col items-center pt-2">
+      <div class="w-2 h-2 rounded-full bg-green-500"></div>
+      <div class="flex-1 w-0.5 bg-green-100 my-1"></div>
+    </div>
+    <div class="flex-1 min-w-0 space-y-2.5 pr-5">
+      <div class="grid grid-cols-2 gap-3">
+        <label class="block min-w-0"><span class="block text-[11px] font-medium text-gray-400 mb-0.5">時間</span>
+          <input type="time" aria-label="時間" autocomplete="off" step="900" class="sch-time w-full text-left text-sm font-bold text-green-600 bg-transparent border-none focus:outline-none focus:ring-1 focus:ring-green-400 rounded px-1" value="${escapeHtml(s.time)}" data-idx="${idx}">
+        </label>
+        <label class="block min-w-0"><span class="block text-[11px] font-medium text-gray-400 mb-0.5">地點</span>
+          <input type="text" aria-label="地點" autocomplete="off" class="sch-location w-full text-sm font-medium text-gray-800 bg-transparent border-none focus:outline-none focus:ring-1 focus:ring-green-400 rounded px-1" value="${escapeHtml(s.location)}" placeholder="例：集合地點" data-idx="${idx}">
+        </label>
+      </div>
+      <label class="block"><span class="block text-[11px] font-medium text-gray-400 mb-0.5">內容</span>
+        <input type="text" aria-label="行程內容" autocomplete="off" class="sch-title w-full text-sm text-gray-800 font-medium bg-transparent border-none focus:outline-none focus:ring-1 focus:ring-green-400 rounded px-1" value="${escapeHtml(s.title)}" placeholder="行程內容..." data-idx="${idx}">
+      </label>
+      <div>
+        <div class="flex items-center justify-between gap-2 mb-0.5"><span class="block text-[11px] font-medium text-gray-400">地點連結</span>${externalUrl ? `<a href="${escapeHtml(externalUrl)}" target="_blank" rel="noopener noreferrer" class="text-[11px] font-semibold text-green-600 hover:underline whitespace-nowrap">開啟連結 ↗</a>` : ''}</div>
+        <input type="url" inputmode="url" aria-label="地點連結" autocomplete="off" autocomplete="off" class="sch-location-url w-full text-sm text-blue-600 bg-transparent border-none focus:outline-none focus:ring-1 focus:ring-green-400 rounded px-1" value="${escapeHtml(s.locationUrl)}" placeholder="貼上 Google Maps 或其他外部連結" data-idx="${idx}">
+      </div>
+    </div>
+    <button class="sch-del absolute top-2 right-2 text-gray-300 hover:text-red-400 p-1" data-idx="${idx}" aria-label="刪除行程">✕</button>
+  </div>`;
+}
+
+function safeExternalUrl(value) {
+  try {
+    const url = new URL(value || '');
+    return ['http:', 'https:'].includes(url.protocol) ? url.href : '';
+  } catch (e) {
+    return '';
+  }
+}
+
+function renderItems() {
+  const {items} = S.act;
+  const unc   = items.filter(i => i.claimers.length===0).length;
+  const noAmt = items.filter(i => i.amount===0).length;
+  const statusBanner = (unc>0||noAmt>0)
+    ? `<div class="mb-4 p-3 bg-amber-50 border border-amber-200 rounded-xl text-xs text-amber-700 flex gap-2"><span>⚠️</span><span>${[unc>0?`<b>${unc}</b> 個品項待認領`:'', noAmt>0?`<b>${noAmt}</b> 個品項待填金額`:''].filter(Boolean).join(' ・ ')}</span></div>`
+    : '<div class="mb-4 p-3 bg-green-50 border border-green-200 rounded-xl text-xs text-green-700">✅ 所有品項已認領並填妥金額，可查看結算囉！</div>';
+    
+  const myItems = S.user ? items.filter(i => i.claimers.includes(S.user)) : [];
+  const myItemsHtml = S.user 
+    ? `<div class="mb-4 bg-green-50 border border-green-200 rounded-2xl p-4 shadow-sm">
+         <h3 class="font-semibold text-green-800 text-sm mb-2">🎒 我負責帶的品項</h3>
+         ${myItems.length > 0 
+           ? `<ul class="list-disc list-inside text-sm text-green-700 space-y-1">${myItems.map(i => `<li>${escapeHtml(i.name)}</li>`).join('')}</ul>` 
+           : `<p class="text-xs text-green-600/70">目前沒有需要帶的東西喔～</p>`}
+       </div>`
+    : '';
+
+  return `<div class="pt-3 pb-28">
+  ${myItemsHtml}
+  ${statusBanner}
+  <div id="item-list-container" class="space-y-1.5">${items.map(renderCard).join('')}</div>
+  <div class="mt-4 flex gap-2 min-w-0">
+    <input id="new-item" type="text" placeholder="＋ 新增品項..."
+      class="flex-1 min-w-0 w-0 px-4 py-3 border-2 border-dashed border-gray-200 rounded-xl text-sm text-gray-500 focus:outline-none focus:border-green-400 bg-white/60">
+    <button id="btn-add-item-a" class="flex-none shrink-0 whitespace-nowrap px-4 py-3 bg-gray-100 hover:bg-gray-200 text-gray-600 rounded-xl text-sm font-medium active:scale-95">新增</button>
+  </div>
+</div>`;
+}
+
+function renderCard(it) {
+  const isExp = S.expandedItem === it.id;
+  // Compact claimer mini-avatars
+  const avatars = it.claimers.length
+    ? `<div class="flex gap-1 flex-wrap justify-end">` + it.claimers.map(c => `<span class="px-2 h-5 rounded-full bg-gradient-to-br ${getColor(c)} flex items-center justify-center text-white text-[10px] font-bold whitespace-nowrap shadow-sm">${escapeHtml(c)}</span>`).join('') + `</div>`
+    : '<span class="text-[11px] text-gray-400 border border-dashed border-gray-300 px-2 py-0.5 rounded-full">未認領</span>';
+  // Expanded: member toggle chips (anyone can assign anyone)
+  const memberChips = S.act.members.map(m => {
+    const on = it.claimers.includes(m);
+    return `<button class="member-toggle px-2 py-0.5 rounded-full text-xs font-medium transition-all border ${on ? 'bg-green-500 text-white border-green-500' : 'bg-white text-gray-500 border-gray-200 hover:border-green-300'}" data-item="${it.id}" data-member="${escapeHtml(m)}">${escapeHtml(m)}${on ? ' ✓' : ''}</button>`;
+  }).join('');
+  const memberOpts = S.act.members.map(m => `<option value="${escapeHtml(m)}"${it.payer===m?' selected':''}>${escapeHtml(m)}</option>`).join('');
+  const sharerChips = S.act.members.map(m => {
+    const on = !it.sharers || it.sharers.includes(m);
+    return `<button class="sharer-toggle px-2 py-0.5 rounded-full text-xs font-medium transition-all border ${on ? 'bg-blue-500 text-white border-blue-500' : 'bg-white text-gray-500 border-gray-200 hover:border-blue-300'}" data-item="${it.id}" data-member="${escapeHtml(m)}">${escapeHtml(m)}${on ? ' ✓' : ''}</button>`;
+  }).join('');
+
+  const expanded = isExp ? `
+    <div class="mt-2.5 pt-2.5 border-t border-gray-100 slide">
+      <div class="flex justify-between items-center mb-1.5">
+        <p class="text-[11px] text-gray-400 font-medium">指派認領人</p>
+        <button class="item-del text-[11px] text-red-400 hover:text-red-600 flex items-center gap-1 px-1.5 py-0.5 rounded hover:bg-red-50 transition-colors" data-id="${it.id}">✕ 刪除品項</button>
+      </div>
+      <div class="flex flex-wrap gap-1.5 mb-2.5">${memberChips}</div>
+      
+      <p class="text-[11px] text-gray-400 mb-1.5 font-medium mt-2">分攤人 (預設全體均攤)</p>
+      <div class="flex flex-wrap gap-1.5 mb-2.5">${sharerChips}</div>
+
+      <div class="flex gap-2 items-end mt-2">
+        <div class="flex-1">
+          <p class="text-[11px] text-gray-400 mb-0.5">代墊人</p>
+          <select class="payer-sel w-full px-2 py-1.5 bg-gray-50 border border-gray-200 rounded-lg text-xs" data-id="${it.id}">
+            <option value="">未指定</option>${memberOpts}
+          </select>
+        </div>
+        <div class="flex-1">
+          <p class="text-[11px] text-gray-400 mb-0.5">金額</p>
+          <div class="flex">
+            <span class="px-1.5 bg-gray-100 border border-r-0 border-gray-200 rounded-l-lg text-gray-400 text-xs flex items-center">$</span>
+            <input type="number" min="0" step="1" placeholder="0" value="${it.amount>0?it.amount:''}"
+              class="amount-inp flex-1 px-2 py-1.5 bg-gray-50 border border-gray-200 rounded-r-lg text-xs w-0" data-id="${it.id}">
+          </div>
+        </div>
+        
+      </div>
+    </div>` : '';
+
+  return `<div class="bg-white rounded-xl p-2.5 shadow-sm border border-gray-100 transition-all ${isExp ? 'ring-2 ring-green-200' : ''}" data-item-id="${it.id}">
+  <div class="row-toggle flex items-center justify-between cursor-pointer select-none" data-id="${it.id}">
+    <div class="flex items-center gap-2 flex-1 min-w-0 mr-2">
+      <span class="drag-handle text-gray-300 hover:text-green-500 cursor-grab p-1 -ml-1 select-none flex-shrink-0" title="拖曳排序" aria-hidden="true">
+        <svg class="w-4 h-4 pointer-events-none" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 8h16M4 16h16"></path></svg>
+      </span>
+      ${isExp ? `<input type="text" class="item-name-inp font-semibold text-gray-800 bg-white border border-green-400 focus:outline-none focus:ring-1 focus:ring-green-400 rounded px-1.5 py-0.5 text-sm w-full" value="${escapeHtml(it.name)}" data-id="${it.id}">` : `<span class="font-semibold text-gray-800 text-sm truncate">${escapeHtml(it.name)}</span>`}
+      <div class="flex -space-x-1 flex-shrink-0 max-w-20 overflow-hidden">${avatars}</div>
+    </div>
+    <div class="flex items-center gap-1.5 flex-shrink-0">
+      ${it.payer ? `<span class="text-[10px] text-gray-400 hidden sm:inline">付:${escapeHtml(it.payer)}</span>` : ''}
+      ${it.amount > 0 ? `<span class="font-bold text-gray-700 text-sm">${fmt(it.amount)}</span>` : '<span class="text-xs text-gray-300">-</span>'}
+      <span class="text-gray-300 text-[10px] ml-0.5">${isExp ? '▲' : '▼'}</span>
+    </div>
+  </div>
+  ${expanded}
+</div>`;
+}
+
+
+
+function renderSettle() {
+  const r = calcSettlement();
+  if (!r) return '<p class="text-gray-400 text-center pt-8">計算中...</p>';
+  const {total, paid, bal, txns} = r;
+  if (total === 0) return '<div class="pt-16 text-center"><div class="text-6xl mb-3">💰</div><p class="text-gray-400 text-sm">尚未記錄任何費用<br>請先在品項中填入代墊人和金額</p></div>';
+
+  const members = S.act.members;
+  const perPersonHtml = members.map(m => {
+    const p=paid[m]||0, b=bal[m]||0, isC=b>0, isD=b<0;
+    const barColor = isC ? 'bg-green-400' : isD ? 'bg-red-400' : 'bg-gray-300';
+    const labelColor = isC ? 'text-green-600' : isD ? 'text-red-500' : 'text-gray-400';
+    const label = isC ? '收回 '+fmt(b) : isD ? '應付 '+fmt(-b) : '✓ 剛好';
+    const barW = total>0 ? Math.min(100,p/total*100) : 0;
+    return `<div class="flex items-center gap-3">
+      <div class="w-9 h-9 rounded-full bg-gradient-to-br ${getColor(m)} flex items-center justify-center text-white text-sm font-bold flex-shrink-0">${escapeHtml(m.charAt(0))}</div>
+      <div class="flex-1 min-w-0">
+        <div class="flex justify-between items-baseline"><span class="font-medium text-gray-700 text-sm truncate">${escapeHtml(m)}</span><span class="text-xs text-gray-400 flex-shrink-0 ml-1">代墊 ${fmt(p)}</span></div>
+        <div class="flex items-center gap-2 mt-1">
+          <div class="flex-1 h-1.5 bg-gray-100 rounded-full overflow-hidden"><div class="h-full rounded-full ${barColor}" style="width:${barW}%"></div></div>
+          <span class="text-xs font-bold flex-shrink-0 ${labelColor}">${label}</span>
+        </div>
+      </div>
+    </div>`;
+  }).join('');
+
+  const shareBtn = `<button id="btn-copy-settle" class="text-xs bg-gray-800 hover:bg-gray-700 text-white font-bold py-1.5 px-3 rounded-full flex items-center gap-1 transition-all shadow-sm active:scale-95"><svg class="w-3.5 h-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M8 16H6a2 2 0 01-2-2V6a2 2 0 012-2h8a2 2 0 012 2v2m-6 12h8a2 2 0 002-2v-8a2 2 0 00-2-2h-8a2 2 0 00-2 2v8a2 2 0 002 2z"></path></svg>分享</button>`;
+  const shareBtnLight = shareBtn.replace('bg-gray-800 hover:bg-gray-700 text-white', 'bg-white hover:bg-gray-50 text-gray-700 border border-gray-200');
+
+  const txnHtml = txns.length
+    ? `<div class="bg-white rounded-2xl p-4 shadow-sm border border-gray-100"><div class="flex justify-between items-center mb-3"><h3 class="font-semibold text-gray-700 text-sm">💸 付款方式（最少次數）</h3>${shareBtn}</div><div class="space-y-2">${txns.map(t => `<div class="flex items-center gap-3 p-3 bg-gray-50 rounded-xl"><div class="w-7 h-7 rounded-full bg-gradient-to-br ${getColor(t.from)} flex items-center justify-center text-white text-xs font-bold flex-shrink-0">${escapeHtml(t.from.charAt(0))}</div><div class="flex-1 text-sm text-gray-600"><span class="font-semibold text-gray-800">${escapeHtml(t.from)}</span><span class="mx-1.5 text-gray-300">→</span><span class="font-semibold text-gray-800">${escapeHtml(t.to)}</span></div><span class="font-bold text-gray-800">${fmt(t.amt)}</span></div>`).join('')}</div></div>`
+    : `<div class="bg-green-50 border border-green-200 rounded-2xl p-4 relative"><div class="absolute top-3 right-3">${shareBtnLight}</div><div class="text-center pt-2"><div class="text-4xl mb-2">🎉</div><p class="text-green-700 text-sm font-semibold">費用已均攤，不需要額外匯款！</p></div></div>`;
+
+  const hasAmtItems = S.act.items.filter(i=>i.amount>0);
+  const itemsDetailHtml = hasAmtItems.length
+    ? `<div class="space-y-1.5">${hasAmtItems.map(i=>{
+        const payerLabel = i.payer ? `<span class="text-xs text-gray-400 ml-2">by ${escapeHtml(i.payer)}</span>` : '';
+        const claimLabel = (i.sharers && i.sharers.length < S.act.members.length) ? `<span class="text-xs text-blue-400 ml-1">(由 ${i.sharers.map(escapeHtml).join(', ')} 分攤)</span>` : '';
+        return `<div class="flex justify-between items-center py-1.5 border-b border-gray-50 last:border-0 text-sm"><div><span class="text-gray-700">${escapeHtml(i.name)}</span>${payerLabel}${claimLabel}</div><span class="font-semibold text-gray-700 flex-shrink-0 ml-2">${fmt(i.amount)}</span></div>`;
+      }).join('')}</div>`
+    : '<p class="text-gray-400 text-sm">尚無品項金額記錄</p>';
+
+  const myCostHtml = S.user ? `
+  <div class="flex justify-between items-center pt-3 border-t border-gray-100">
+    <span class="text-sm text-gray-500 font-medium">個人總支出 <span class="text-xs text-gray-400">(${escapeHtml(S.user)})</span></span>
+    <span class="text-xl font-bold text-red-500">${fmt(r.cost[S.user])}</span>
+  </div>` : '';
+
+  return `<div class="pt-3 pb-28 space-y-4">
+  ${txnHtml}
+  <div class="bg-white rounded-2xl p-4 shadow-sm border border-gray-100 space-y-3">
+    <div class="flex justify-between items-center">
+      <span class="text-sm text-gray-500 font-medium">活動總支出</span>
+      <span class="text-2xl font-bold text-gray-800">${fmt(total)}</span>
+    </div>
+    ${myCostHtml}
+  </div>
+  <div class="bg-white rounded-2xl p-4 shadow-sm border border-gray-100"><h3 class="font-semibold text-gray-700 mb-4 text-sm">各人代墊明細</h3><div class="space-y-4">${perPersonHtml}</div></div>
+  <div class="bg-white rounded-2xl p-4 shadow-sm border border-gray-100"><h3 class="font-semibold text-gray-700 mb-3 text-sm">📋 品項費用明細</h3>${itemsDetailHtml}</div>
+</div>`;
+}
+
+// ── event binding ──────────────────────────────────────────────────
+function bind() {
+  const on = (id,ev,fn) => { const el=$e(id); if(el) el.addEventListener(ev,fn); };
+
+  // home
+  on('btn-create','click',() => { if(!S.apiUrl){S.page='setup';render();return;} S.draft={name:'',members:[],items:[]}; S.page='create'; render(); });
+  on('btn-join','click', doJoin);
+  on('join-input','keydown', e => { if(e.key==='Enter') doJoin(); });
+  on('btn-go-setup','click', () => { S.page='setup'; render(); });
+  on('btn-settings','click', () => { S.page='setup'; render(); });
+
+  // setup
+  on('btn-back','click', goHome);
+  on('btn-save-api','click', () => {
+    const url = $e('api-input')?.value?.trim();
+    if (!url) { toast('請輸入 API URL','err'); return; }
+    S.apiUrl = url; localStorage.setItem('agy_trip_api', url);
+    toast('✅ 設定已儲存','ok'); goHome();
+  });
+  on('btn-test','click', async () => {
+    const url = $e('api-input')?.value?.trim(), res = $e('test-result');
+    if (!url || !res) return;
+    res.innerHTML = '<p class="text-sm text-gray-400">🔄 測試中...</p>';
+    try {
+      const u = new URL(url); u.searchParams.set('action','ping');
+      const d = await (await fetch(u.toString())).json();
+      res.innerHTML = d.status==='ok'
+        ? '<p class="text-sm text-green-600 font-medium">✅ 連線成功！</p>'
+        : `<p class="text-sm text-red-500">❌ ${d.error||'未知錯誤'}</p>`;
+    } catch(e) { res.innerHTML = `<p class="text-sm text-red-500">❌ ${e.message}</p>`; }
+  });
+
+  // create
+  bindCreate();
+
+  // activity header
+  on('btn-share','click', () => {
+    const url = new URL(location.href); url.search = '?id='+S.actId;
+    navigator.clipboard?.writeText(url.toString()); toast('✅ 分享連結已複製！','ok');
+  });
+  on('user-sel','change', e => { S.user=e.target.value; if(S.user&&S.actId) localStorage.setItem('agy_user_'+S.actId,S.user); render(); });
+  
+  // Schedule bindings
+  on('tab-schedule', 'click', () => { S.tab='schedule'; render(); });
+  const addScheduleOnDate = async date => {
+    if (!date) { toast('請先選擇日期', 'err'); return; }
+    if(!S.act.schedule) S.act.schedule=[];
+    S.act.schedule.push({date, time:'', location:'', title:'', locationUrl:''});
+    S.scheduleDateDraft = null;
+    render();
+    await saveSchedule();
+  };
+  on('new-schedule-date', 'change', e => { S.scheduleDateDraft = e.target.value; });
+  on('btn-add-sch', 'click', () => addScheduleOnDate($e('new-schedule-date')?.value));
+  document.querySelectorAll('.sch-add-on-date').forEach(btn => {
+    btn.addEventListener('click', e => addScheduleOnDate(e.currentTarget.dataset.date));
+  });
+  document.querySelectorAll('.sch-assign-undated').forEach(input => {
+    input.addEventListener('change', async e => {
+      const date = e.currentTarget.value;
+      if (!date) return;
+      S.act.schedule.forEach(s => { if (!s.date) s.date = date; });
+      S.scheduleDateDraft = null;
+      await saveSchedule();
+      render();
+    });
+  });
+  
+  
+  // 點擊時間輸入框直接觸發原生選擇器
+  document.querySelectorAll('.sch-time').forEach(el => {
+    el.addEventListener('click', e => {
+      try { e.target.showPicker(); } catch(err) {}
+    });
+  });
+document.querySelectorAll('.sch-time, .sch-location, .sch-title, .sch-location-url').forEach(el => {
+    // 記住進入時的值
+    el.addEventListener('focus', e => { e.target.dataset.orig = e.target.value; });
+    const saveField = async e => {
+      let val = e.target.value.trim();
+      if (val === (e.target.dataset.orig || '').trim()) return; // 沒改就不要打 API
+      
+      const idx = e.target.dataset.idx;
+      const field = e.target.classList.contains('sch-time') ? 'time'
+        : e.target.classList.contains('sch-location') ? 'location'
+        : e.target.classList.contains('sch-location-url') ? 'locationUrl' : 'title';
+      S.act.schedule[idx][field] = val;
+      e.target.dataset.orig = val;
+      await saveSchedule();
+      // 取消立刻重繪，避免輸入到一半 DOM 被重建導致焦點遺失或瀏覽器 Autofill 錯亂
+      // 排序會在下次背景更新或手動重整時自動生效。
+    };
+    el.addEventListener('blur', saveField);
+    el.addEventListener('keydown', e => { if(e.key==='Enter') e.target.blur(); });
+  });
+  
+  document.querySelectorAll('.sch-del').forEach(el => {
+    el.addEventListener('click', async e => {
+      const idx = e.target.dataset.idx;
+      S.act.schedule.splice(idx, 1);
+      render();
+      await saveSchedule();
+    });
+  });
+
+  on('tab-items','click',  () => { S.tab='items';      render(); });
+    on('btn-copy-settle', 'click', () => {
+    if (!S.act) return;
+    const r = calcSettlement();
+    if (!r || r.total === 0) return;
+    let text = `【${S.act.name}】結算明細 💰\n\n`;
+    text += `活動總支出：${fmt(r.total)}\n`;
+    text += `\n💸 建議付款方式：\n`;
+    if (r.txns.length === 0) {
+      text += `費用已均攤，不需要額外匯款！\n`;
+    } else {
+      r.txns.forEach(t => {
+        text += `${t.from} ➡️ ${t.to}：${fmt(t.amt)}\n`;
+      });
+    }
+    text += `\n💡 個人明細請到 ${S.act.name} 確認\n`;
+    if (navigator.clipboard && navigator.clipboard.writeText) {
+        navigator.clipboard.writeText(text).then(() => toast('✅ 結算文字已複製', 'ok'));
+    } else {
+        toast('❌ 瀏覽器不支援複製，請手動選取', 'err');
+    }
+  });
+  on('tab-settle','click', () => { S.tab='settlement'; render(); });
+  on('btn-refresh','click',() => { if(S.actId) loadAct(S.actId); });
+
+  // add item in activity
+  const doAddItem = async () => {
+    const inp=$e('new-item'), name=inp?.value?.trim(); if(!name) return; inp.value='';
+    const tmpId='tmp_'+Date.now(); 
+    S.act.items.push({id:tmpId,name,claimers:[],payer:'',amount:0, sharers:null}); render();
+    
+    S.syncing = (S.syncing || 0) + 1; S.lastWriteTime = Date.now(); // BUG FIX 4
+    try { 
+      const res = await apiPost({action:'addItem',activityId:S.actId,name}); 
+      // BUG FIX 4: 直接更新 ID，不要 loadAct，避免 Google Sheet 資料庫延遲導致剛新增的項目消失
+      const item = S.act.items.find(i=>i.id===tmpId);
+      if (item) item.id = res.itemId;
+      render();
+    }
+    catch(e) { toast('❌ '+e.message,'err'); S.act.items=S.act.items.filter(i=>i.id!==tmpId); render(); }
+    finally { S.syncing--; S.lastWriteTime = Date.now(); }
+  };
+  on('btn-add-item-a','click', doAddItem);
+  on('new-item','keydown', e => { if(e.key==='Enter') doAddItem(); });
+
+  // row toggle expand/collapse
+  
+  const itemList = $e('item-list-container');
+  if (itemList && window.Sortable) {
+    Sortable.create(itemList, {
+      animation: 150,
+      handle: '.drag-handle',
+      ghostClass: 'opacity-50',
+      onEnd: async (evt) => {
+        if (evt.oldIndex === evt.newIndex) return;
+        const item = S.act.items.splice(evt.oldIndex, 1)[0];
+        S.act.items.splice(evt.newIndex, 0, item);
+        S.syncing = (S.syncing || 0) + 1; S.lastWriteTime = Date.now();
+        try {
+          await apiPost({ action: 'reorderItems', activityId: S.actId, itemIds: S.act.items.map(i => i.id) });
+        } catch (e) { toast('排序儲存失敗: ' + e.message, 'err'); }
+        finally { S.syncing--; S.lastWriteTime = Date.now(); }
+      }
+    });
+  }
+
+  document.querySelectorAll('.row-toggle').forEach(el => {
+    el.addEventListener('click', e => {
+      // 手機上的 tap/click 事件會冒泡；互動控制項不應觸發卡片收合。
+      if (e.target.closest('input, select, button, label, .drag-handle')) return;
+      const id = e.currentTarget.dataset.id;
+      S.expandedItem = S.expandedItem === id ? null : id;
+      render();
+    });
+  });
+
+  // member toggle chips (anyone can assign anyone)
+  document.querySelectorAll('.member-toggle').forEach(btn => {
+    btn.addEventListener('click', async e => {
+      e.stopPropagation();
+      const itemId = e.currentTarget.dataset.item;
+      const member = e.currentTarget.dataset.member;
+      const item = S.act?.items?.find(i => String(i.id) === String(itemId));
+      if (!item) return;
+      const nc = item.claimers.includes(member)
+        ? item.claimers.filter(c => c !== member)
+        : [...item.claimers, member];
+      const nEl=document.querySelector(`.item-name-inp[data-id="${itemId}"]`); await updateItemRemote(itemId, nEl?nEl.value:item.name, nc, item.payer, item.amount, item.sharers);
+    });
+  });
+
+    // sharer toggle chips
+  document.querySelectorAll('.sharer-toggle').forEach(btn => {
+    btn.addEventListener('click', async e => {
+      e.stopPropagation();
+      const itemId = e.currentTarget.dataset.item;
+      const member = e.currentTarget.dataset.member;
+      const item = S.act?.items?.find(i => String(i.id) === String(itemId));
+      if (!item) return;
+      let sh = item.sharers || [...S.act.members];
+      if (sh.includes(member)) sh = sh.filter(c => c !== member);
+      else sh = [...sh, member];
+      if (sh.length === 0) { toast('至少需要一位分攤人', 'err'); return; }
+      const nEl=document.querySelector(`.item-name-inp[data-id="${itemId}"]`); await updateItemRemote(itemId, nEl?nEl.value:item.name, item.claimers, item.payer, item.amount, sh);
+    });
+  });
+
+  // delete item
+  document.querySelectorAll('.item-del').forEach(btn => {
+    btn.addEventListener('click', async e => {
+      const id = e.currentTarget.dataset.id;
+      if (!confirm('確定要刪除此品項嗎？')) return;
+      
+      // Optimistic update
+      S.act.items = S.act.items.filter(i => String(i.id) !== String(id));
+      render();
+      
+      S.syncing = (S.syncing || 0) + 1; S.lastWriteTime = Date.now(); // BUG FIX 5: 鎖定自動更新，避免刪除後舊資料又閃現
+      try {
+        await apiPost({ action: 'deleteItem', activityId: S.actId, itemId: id });
+        toast('✅ 已刪除', 'ok');
+      } catch (err) {
+        toast('刪除失敗: ' + err.message, 'err');
+        loadAct(S.actId); // Revert on failure
+      } finally {
+        S.syncing--; S.lastWriteTime = Date.now();
+      }
+    });
+  });
+
+
+  // payer select — auto-save
+  document.querySelectorAll('.payer-sel').forEach(sel => {
+    sel.addEventListener('change', async e => {
+      const id=e.currentTarget.dataset.id, card=e.currentTarget.closest('[data-item-id]');
+      const amtEl=card?.querySelector('.amount-inp'), item=S.act?.items?.find(i=>String(i.id)===String(id));
+      if(!item) return;
+      const nEl=card?.querySelector(".item-name-inp"); await updateItemRemote(id, nEl?nEl.value:item.name, item.claimers, e.currentTarget.value, amtEl?+amtEl.value:item.amount, item.sharers, false);
+    });
+  });
+
+  // item name input — save on blur
+  document.querySelectorAll('.item-name-inp').forEach(inp => {
+    inp.addEventListener('blur', async e => {
+      const id=e.currentTarget.dataset.id, card=e.currentTarget.closest('[data-item-id]');
+      const payerEl=card?.querySelector('.payer-sel'), amtEl=card?.querySelector('.amount-inp');
+      const item=S.act?.items?.find(i=>String(i.id)===String(id));
+      if(!item) return;
+      const val = e.currentTarget.value.trim();
+      if (val === item.name || !val) return;
+      await updateItemRemote(id, val, item.claimers, payerEl?payerEl.value:item.payer, amtEl?+amtEl.value:item.amount, item.sharers, false);
+    });
+    inp.addEventListener('keydown', e => { if(e.key==='Enter') e.target.blur(); });
+  });
+
+  // amount input — save on blur
+  document.querySelectorAll('.amount-inp').forEach(inp => {
+    inp.addEventListener('blur', async e => {
+      const id=e.currentTarget.dataset.id, card=e.currentTarget.closest('[data-item-id]');
+      const payerEl=card?.querySelector('.payer-sel'), item=S.act?.items?.find(i=>String(i.id)===String(id));
+      if(!item) return;
+      const nEl=card?.querySelector(".item-name-inp"); await updateItemRemote(id, nEl?nEl.value:item.name, item.claimers, payerEl?payerEl.value:item.payer, +e.currentTarget.value||0, item.sharers, false);
+    });
+    inp.addEventListener('keydown', e => { if(e.key==='Enter') e.target.blur(); });
+  });
+
+
+}
+
+function bindCreate() {
+  const saveName = () => { if($e('act-name')) S.draft.name = $e('act-name').value; };
+  const addMember = () => {
+    saveName(); const inp=$e('member-input'), n=inp?.value?.trim();
+    if(!n||S.draft.members.includes(n)){inp?.focus();return;}
+    S.draft.members.push(n); inp.value='';
+    const w=$e('members-wrap'); if(w){w.innerHTML=S.draft.members.map(memberChip).join('');bindChips();} inp.focus();
+  };
+  const addItemC = () => {
+    saveName(); const inp=$e('item-input'), n=inp?.value?.trim();
+    if(!n||S.draft.items.includes(n)){inp?.focus();return;}
+    S.draft.items.push(n); inp.value='';
+    const w=$e('items-wrap'); if(w){w.innerHTML=S.draft.items.map(itemRow).join('');bindChips();} inp.focus();
+  };
+  const on=(id,ev,fn)=>{const el=$e(id);if(el)el.addEventListener(ev,fn);};
+  on('btn-add-member','click', addMember);
+  on('create-id','input', e => { e.target.value = e.target.value.toUpperCase(); });
+  on('member-input','keydown', e => { if(e.key==='Enter'){e.preventDefault();addMember();} });
+  on('btn-add-item-c','click', addItemC);
+  on('item-input','keydown', e => { if(e.key==='Enter'){e.preventDefault();addItemC();} });
+  on('btn-submit','click', async () => {
+    const name=$e('act-name')?.value?.trim()||S.draft.name, members=S.draft.members, items=S.draft.items;
+    const customId=$e('create-id')?.value?.trim().toUpperCase()||'';
+    if(!name){toast('❌ 請輸入活動名稱','err');return;}
+    if(!members.length){toast('❌ 請新增至少一位成員','err');return;}
+    if(customId && !/^[A-Z0-9]{3,24}$/.test(customId)) { toast('❌ 活動代碼須為 3～24 位英文字母或數字','err'); return; }
+    const btn=$e('btn-submit'); if(btn){btn.textContent='建立中...';btn.disabled=true;}
+    try {
+      const d=await apiPost({action:'createActivity',name,members,items,customId}), id=d.activityId;
+      S.actId=id; S.user=members[0]; localStorage.setItem('agy_user_'+id, members[0]);
+      const url=new URL(location.href); url.searchParams.set('id',id); history.pushState({},'',url.toString());
+      S.page='activity'; S.tab='items'; await loadAct(id);
+    } catch(e) { toast('❌ '+e.message,'err'); if(btn){btn.textContent='🚀 建立活動';btn.disabled=false;} }
+  });
+  bindChips();
+}
+
+function bindChips() {
+  document.querySelectorAll('.rm-member').forEach(btn => {
+    btn.addEventListener('click', e => { S.draft.members.splice(+e.currentTarget.dataset.i,1); const w=$e('members-wrap'); if(w){w.innerHTML=S.draft.members.map(memberChip).join('');bindChips();} });
+  });
+  document.querySelectorAll('.rm-item').forEach(btn => {
+    btn.addEventListener('click', e => { S.draft.items.splice(+e.currentTarget.dataset.i,1); const w=$e('items-wrap'); if(w){w.innerHTML=S.draft.items.map(itemRow).join('');bindChips();} });
+  });
+}
+
+function goHome() { S.page='home'; S.act=null; S.actId=null; history.pushState({},'',location.pathname); render(); }
+
+function doJoin() {
+  const id=$e('join-input')?.value?.trim();
+  if(!id){toast('請輸入活動代碼','err');return;}
+  if(!S.apiUrl){toast('請先設定 API URL','err');S.page='setup';render();return;}
+  S.actId=id; S.user=localStorage.getItem('agy_user_'+id)||null; S.act=null;
+  const url=new URL(location.href); url.searchParams.set('id',id); history.pushState({},'',url.toString());
+  S.page='activity'; S.tab='items'; loadAct(id);
+}
+
+// ── init ───────────────────────────────────────────────────────────
+(function init() {
+  if (S.actId) {
+    S.user = localStorage.getItem('agy_user_'+S.actId);
+    S.page = 'activity';
+    if (!S.apiUrl) { S.page='setup'; render(); return; }
+    render(); loadAct(S.actId);
+  } else { render(); }
+})();
+</script>
+</body>
+</html>
