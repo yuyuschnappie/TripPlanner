@@ -69,6 +69,24 @@ const hasAmount = value => value !== null && value !== undefined && value !== ''
 const escapeHtml = value => String(value ?? '').replace(/[&<>"']/g, ch => ({
   '&':'&amp;', '<':'&lt;', '>':'&gt;', '"':'&quot;', "'":'&#39;'
 }[ch]));
+const RECENT_ACTIVITIES_KEY = 'agy_recent_activities';
+function getRecentActivities() {
+  try {
+    const value = JSON.parse(localStorage.getItem(RECENT_ACTIVITIES_KEY) || '[]');
+    return Array.isArray(value)
+      ? value.filter(item => item && item.id && item.name).slice(0, 5)
+      : [];
+  } catch (e) {
+    return [];
+  }
+}
+function rememberRecentActivity(id, name) {
+  if (!id || !name) return;
+  const normalizedId = String(id);
+  const recent = getRecentActivities().filter(item => String(item.id) !== normalizedId);
+  recent.unshift({ id: normalizedId, name: String(name), viewedAt: Date.now() });
+  try { localStorage.setItem(RECENT_ACTIVITIES_KEY, JSON.stringify(recent.slice(0, 5))); } catch (e) {}
+}
 
 // API 連線由 app-config.js 依目前前端網域自動選擇 master 或 dev。
 const DEFAULT_API_URL = window.TRIP_PLANNER_CONFIG?.apiUrl || '';
@@ -138,6 +156,7 @@ async function loadAct(id, isSilent = false) {
   try {
     const d = await apiGet({ action: 'getActivity', id });
     const newAct = d.activity;
+    if (!isSilent) rememberRecentActivity(id, newAct?.name);
     
     // BUG FIX 4: 如果正在寫入資料，或剛寫完不到 15 秒（避免讀到延遲的舊資料），暫停背景更新
     if (S.syncing > 0 || (S.lastWriteTime && Date.now() - S.lastWriteTime < 15000)) {
@@ -272,6 +291,21 @@ function renderHome() {
   const apiWarn = !S.apiUrl && DEV_SETTINGS
     ? '<div class="mt-8 p-4 bg-amber-50 border border-amber-200 rounded-xl text-sm text-amber-700 flex gap-3"><span>⚠️</span><div>尚未設定 API 連線<br><button id="btn-go-setup" class="font-semibold underline mt-1">立即設定 →</button></div></div>'
     : '';
+  const recentActivities = getRecentActivities();
+  const recentHtml = recentActivities.length
+    ? `<section class="mt-8">
+        <h2 class="mb-3 text-sm font-bold text-gray-700">近期瀏覽過的活動</h2>
+        <div class="space-y-2">
+          ${recentActivities.map(activity => `<button type="button" class="recent-activity w-full flex items-center justify-between gap-3 px-4 py-3 bg-white border border-gray-200 rounded-xl text-left shadow-sm hover:border-green-400 hover:bg-green-50 active:scale-[0.99] transition-all" data-id="${escapeHtml(activity.id)}">
+            <span class="min-w-0">
+              <span class="block font-semibold text-gray-800 truncate">${escapeHtml(activity.name)}</span>
+              <span class="block mt-0.5 text-[11px] text-gray-400 truncate">活動代碼：${escapeHtml(activity.id)}</span>
+            </span>
+            <span class="flex-none text-green-500" aria-hidden="true">→</span>
+          </button>`).join('')}
+        </div>
+      </section>`
+    : '';
   return `<div class="pt-16 pb-8 slide">
   <div class="text-center mb-12">
     <div class="text-7xl mb-3">🏕️</div>
@@ -288,6 +322,7 @@ function renderHome() {
       <button id="btn-join" class="flex-none shrink-0 whitespace-nowrap px-5 py-3 bg-gray-800 text-white font-medium rounded-xl active:scale-95 transition-all">加入</button>
     </div>
   </div>
+  ${recentHtml}
   ${apiWarn}
   ${DEV_SETTINGS ? `<div class="mt-8 text-center">
     <button id="btn-settings" class="text-xs text-gray-300 hover:text-gray-500 transition-colors">⚙️ API 設定</button>
@@ -738,6 +773,9 @@ function bind() {
   on('btn-create','click',() => { if(!S.apiUrl){S.page='setup';render();return;} S.draft={name:'',members:[],items:[]}; S.page='create'; render(); });
   on('btn-join','click', doJoin);
   on('join-input','keydown', e => { if(e.key==='Enter') doJoin(); });
+  document.querySelectorAll('.recent-activity').forEach(button => {
+    button.addEventListener('click', e => openActivity(e.currentTarget.dataset.id));
+  });
   on('btn-go-setup','click', () => { S.page='setup'; render(); });
   on('btn-settings','click', () => { S.page='setup'; render(); });
 
@@ -1144,14 +1182,16 @@ function goHome() {
   history.pushState({},'',location.pathname); render();
 }
 
-function doJoin() {
-  const id=$e('join-input')?.value?.trim();
+function openActivity(id) {
+  id=String(id || '').trim();
   if(!id){toast('請輸入活動代碼','err');return;}
   if(!S.apiUrl){toast('請先設定 API URL','err');S.page='setup';render();return;}
   S.actId=id; S.user=localStorage.getItem('agy_user_'+id)||null; S.act=null;
   const url=new URL(location.href); url.searchParams.set('id',id); history.pushState({},'',url.toString());
   S.page='activity'; S.tab='items'; loadAct(id);
 }
+
+function doJoin() { openActivity($e('join-input')?.value); }
 
 // ── init ───────────────────────────────────────────────────────────
 (function init() {
