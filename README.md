@@ -101,7 +101,7 @@ Google Sheets       (資料庫，結構化儲存活動與品項資料)
 | activityId | name | members | createdAt | schedule | storageVersion |
 
 **items 工作表（所有活動的品項）**
-| activityId | itemId | name | claimers | payer | amount | sharers | updatedAt |
+| activityId | itemId | name | claimers | payer | amount | sharers | updatedAt | amountSet |
 
 ---
 

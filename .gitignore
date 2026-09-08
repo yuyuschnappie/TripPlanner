@@ -1,0 +1,27 @@
+# 作業系統產生的檔案
+.DS_Store
+Thumbs.db
+Desktop.ini
+
+# 編輯器與 IDE 設定
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# 暫存檔與記錄
+*.log
+*.tmp
+*.temp
+
+# 本機環境設定與憑證
+.env
+.env.*
+!.env.example
+.clasprc.json
+
+# 前端相依套件與建置輸出
+node_modules/
+dist/
+coverage/

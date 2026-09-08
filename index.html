@@ -3,7 +3,8 @@
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>一起出遊 🏕️</title>
+  <title>一起出遊</title>
+  <link rel="icon" href="data:image/svg+xml,<svg xmlns=%22http://www.w3.org/2000/svg%22 viewBox=%220 0 100 100%22><text y=%22.9em%22 font-size=%2290%22>🏕️</text></svg>">
   <script src="https://cdn.tailwindcss.com"></script>
   <link href="https://fonts.googleapis.com/css2?family=Noto+Sans+TC:wght@400;500;700&display=swap" rel="stylesheet">
   <style>
@@ -11,8 +12,10 @@
     body { background: linear-gradient(160deg,#f0fdf4 0%,#ecfdf5 100%); min-height:100vh; }
     .spin  { animation: spin  1s linear   infinite; }
     .slide { animation: slide .25s ease; }
+    .fade  { animation: fade .15s ease-out; }
     @keyframes spin  { to { transform: rotate(360deg); } }
     @keyframes slide { from { opacity:0; transform:translateY(8px); } to { opacity:1; transform:none; } }
+    @keyframes fade  { from { opacity:0; } to { opacity:1; } }
     input[type=number]::-webkit-inner-spin-button,
     input[type=number]::-webkit-outer-spin-button { -webkit-appearance:none; margin:0; }
     ::-webkit-scrollbar { width:3px; }
@@ -45,6 +48,7 @@
 // ── utils ──────────────────────────────────────────────────────────
 const $e = id => document.getElementById(id);
 const fmt = n => '$' + (+n || 0).toLocaleString('zh-TW', {maximumFractionDigits:2});
+const hasAmount = value => value !== null && value !== undefined && value !== '';
 const escapeHtml = value => String(value ?? '').replace(/[&<>"']/g, ch => ({
   '&':'&amp;', '<':'&lt;', '>':'&gt;', '"':'&quot;', "'":'&#39;'
 }[ch]));
@@ -53,9 +57,25 @@ const escapeHtml = value => String(value ?? '').replace(/[&<>"']/g, ch => ({
 // Web App URL 不是祕密；請搭配後端的輸入驗證與使用量監控。
 const DEFAULT_API_URL = 'https://script.google.com/macros/s/AKfycbygKTfIk0pqval3Df8Y2Xj_HhJMpYCiu_FvZzyEQWEdXSoaEYhOoV3Ga-_yLqwSZlzk/exec';
 const DEV_SETTINGS = new URLSearchParams(location.search).get('setup') === '1';
-const COLORS = ['from-green-400 to-emerald-500','from-blue-400 to-cyan-500',
-  'from-purple-400 to-violet-500','from-amber-400 to-orange-500','from-pink-400 to-rose-500'];
-const getColor = name => COLORS[(name||'?').charCodeAt(0) % COLORS.length];
+const COLORS = [
+  'from-blue-500 to-cyan-600', 'from-purple-500 to-violet-600',
+  'from-pink-500 to-rose-600', 'from-amber-500 to-orange-600',
+  'from-emerald-500 to-green-600', 'from-indigo-500 to-blue-600',
+  'from-fuchsia-500 to-purple-600', 'from-rose-500 to-red-600',
+  'from-cyan-600 to-teal-600', 'from-orange-500 to-red-500',
+  'from-teal-500 to-emerald-600', 'from-violet-500 to-indigo-600',
+  'from-sky-500 to-blue-600', 'from-lime-600 to-green-600',
+  'from-red-500 to-rose-600', 'from-slate-500 to-gray-600'
+];
+function getColor(name) {
+  const normalizedName = String(name || '?');
+  const memberIndex = S.act?.members?.findIndex(m => String(m) === normalizedName) ?? -1;
+  if (memberIndex >= 0) return COLORS[memberIndex % COLORS.length];
+
+  let hash = 0;
+  for (const char of normalizedName) hash = (hash * 31 + char.codePointAt(0)) >>> 0;
+  return COLORS[hash % COLORS.length];
+}
 
 function toast(msg, type) {
   const c = {ok:'bg-green-600',err:'bg-red-600',info:'bg-gray-800'};
@@ -72,7 +92,8 @@ const S = {
   apiUrl: DEV_SETTINGS ? localStorage.getItem('agy_trip_api') || DEFAULT_API_URL : DEFAULT_API_URL,
   actId:  new URLSearchParams(location.search).get('id'),
   act: null, user: null, tab: 'schedule', busy: false, syncing: 0,
-  expandedItem: null, autoRefreshTimer: null, scheduleDateDraft: null,
+  expandedItem: null, editingItemName: null, autoRefreshTimer: null, scheduleDateDraft: null,
+  datePickerOpen: false, datePickerMonth: null,
   draft: { name:'', members:[], items:[] }
 };
 
@@ -158,9 +179,10 @@ async function saveSchedule() {
 
 async function updateItemRemote(itemId, name, claimers, payer, amount, sharers, shouldRender = true) {
   const item = S.act?.items?.find(i => String(i.id) === String(itemId));
+  const normalizedAmount = hasAmount(amount) ? Number(amount) : null;
   if (item) { 
     if(name) item.name=name;
-    item.claimers=claimers; item.payer=payer; item.amount=+amount||0; 
+    item.claimers=claimers; item.payer=payer; item.amount=normalizedAmount;
     item.sharers=sharers; 
     // 文字欄／金額欄在手機上輸入時不可重建整張卡片，否則焦點與鍵盤會被中斷。
     if (shouldRender) render();
@@ -168,7 +190,7 @@ async function updateItemRemote(itemId, name, claimers, payer, amount, sharers, 
   S.syncing = (S.syncing || 0) + 1; S.lastWriteTime = Date.now(); 
   let failed = false;
   try { 
-    await apiPost({action:'updateItem',activityId:S.actId,itemId,name:name||item.name,claimers,payer,amount:+amount||0, sharers: sharers||null}); 
+    await apiPost({action:'updateItem',activityId:S.actId,itemId,name:name||item.name,claimers,payer,amount:normalizedAmount, sharers: sharers||null});
   }
   catch(e) { toast('❌ 儲存失敗：'+e.message,'err'); failed = true; }
   finally {
@@ -186,7 +208,7 @@ function calcSettlement() {
   let totalCents = 0;
   
   items.forEach(it => {
-    if (it.payer && it.amount > 0) {
+    if (it.payer && hasAmount(it.amount) && it.amount > 0) {
       const amountCents = Math.round(Number(it.amount) * 100);
       paidCents[it.payer] = (paidCents[it.payer]||0) + amountCents;
       balCents[it.payer] = (balCents[it.payer]||0) + amountCents;
@@ -345,8 +367,8 @@ function renderActivity() {
   const itemsTab   = S.tab==='items'      ? 'border-green-500 text-green-600' : 'border-transparent text-gray-400';
   const settleTab  = S.tab==='settlement' ? 'border-green-500 text-green-600' : 'border-transparent text-gray-400';
 
-  return `<div class="slide">
-  <div class="sticky top-0 z-20 bg-green-50/95 backdrop-blur-sm pt-6 pb-2">
+  return `<div>
+  <div id="activity-header" class="sticky top-0 z-20 bg-green-50/95 backdrop-blur-sm pt-6 pb-2">
     <div class="flex items-start justify-between mb-3">
       <div>
         <h1 class="text-xl font-bold text-gray-800 leading-tight">${escapeHtml(S.act.name)}</h1>
@@ -369,10 +391,14 @@ function renderActivity() {
     </div>
   </div>
   ${S.tab === 'schedule' ? renderSchedule() : S.tab === 'items' ? renderItems() : renderSettle()}
-  <div class="fixed bottom-8 right-4 z-30">
-    <button id="btn-refresh" class="w-12 h-12 bg-white shadow-lg rounded-full flex items-center justify-center text-xl active:scale-90 transition-all${S.busy?' spin':''}">🔄</button>
   </div>
-</div>`;
+  <div class="fixed bottom-8 right-4 z-30">
+    <button id="btn-to-top" type="button" aria-label="回到頂端" title="回到頂端" class="w-12 h-12 bg-white text-green-600 shadow-lg rounded-full flex items-center justify-center active:scale-90 transition-all hover:bg-green-50">
+      <svg class="w-6 h-6" fill="none" stroke="currentColor" viewBox="0 0 24 24" aria-hidden="true"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M5 15l7-7 7 7"></path></svg>
+    </button>
+  </div>
+  ${S.datePickerOpen ? renderDatePicker() : ''}
+  `;
 }
 
 
@@ -408,10 +434,41 @@ function renderSchedule() {
   return `<div class="pt-3 pb-28">
     ${undatedCount ? `<div class="mb-4 p-3 bg-amber-50 border border-amber-200 rounded-xl text-xs text-amber-700">⚠️ 有 <b>${undatedCount}</b> 筆舊行程尚未設定日期，請補上日期以顯示在時間軸中。</div>` : ''}
     <div class="mb-4" id="sch-list">${timelineHtml}</div>
-    <div class="flex gap-2 min-w-0">
-      <input id="new-schedule-date" type="date" aria-label="新增日期" value="${S.scheduleDateDraft || nextScheduleDate()}"
-        class="flex-1 min-w-0 w-0 px-3 py-3 border-2 border-dashed border-green-200 rounded-xl text-sm text-gray-600 focus:outline-none focus:border-green-400 bg-white/60">
-      <button id="btn-add-sch" class="flex-none shrink-0 whitespace-nowrap px-4 py-3 border-2 border-dashed border-green-200 text-green-600 rounded-xl text-sm font-semibold hover:bg-green-50 active:scale-95 transition-all">＋ 新增日期</button>
+    <div class="relative w-20 h-20 mx-auto">
+      <button id="btn-add-sch" type="button" class="w-full h-full flex items-center justify-center border-2 border-dashed border-green-300 text-green-600 bg-green-50/50 rounded-full text-xs font-semibold hover:bg-green-50 hover:border-green-400 focus:outline-none focus-visible:ring-2 focus-visible:ring-green-400 active:scale-95 transition-all">＋ 新增日期</button>
+    </div>
+  </div>`;
+}
+
+function renderDatePicker() {
+  const base = /^\d{4}-\d{2}$/.test(S.datePickerMonth || '') ? S.datePickerMonth : localDateValue().slice(0, 7);
+  const [year, month] = base.split('-').map(Number);
+  const firstWeekday = new Date(year, month - 1, 1).getDay();
+  const daysInMonth = new Date(year, month, 0).getDate();
+  const today = localDateValue();
+  const blanks = Array.from({length:firstWeekday}, () => '<span></span>').join('');
+  const days = Array.from({length:daysInMonth}, (_, index) => {
+    const day = index + 1;
+    const date = `${year}-${String(month).padStart(2, '0')}-${String(day).padStart(2, '0')}`;
+    const isToday = date === today;
+    return `<button type="button" class="date-picker-day aspect-square rounded-lg text-sm font-medium ${isToday ? 'bg-green-500 text-white' : 'text-gray-700 hover:bg-green-50 hover:text-green-700'} focus:outline-none focus-visible:ring-2 focus-visible:ring-green-400" data-date="${date}">${day}</button>`;
+  }).join('');
+
+  return `<div id="date-picker-overlay" class="fixed inset-0 z-50 flex items-center justify-center p-4 bg-gray-900/25 backdrop-blur-[1px]">
+    <div role="dialog" aria-modal="true" aria-label="選擇新增日期" class="w-full max-w-xs bg-white rounded-2xl shadow-2xl border border-green-100 p-4 fade">
+      <div class="flex items-center justify-between mb-3">
+        <button type="button" class="date-picker-nav w-9 h-9 rounded-full text-gray-500 hover:bg-gray-100" data-offset="-1" aria-label="上一個月">←</button>
+        <h3 class="font-bold text-gray-800">${year} 年 ${month} 月</h3>
+        <button type="button" class="date-picker-nav w-9 h-9 rounded-full text-gray-500 hover:bg-gray-100" data-offset="1" aria-label="下一個月">→</button>
+      </div>
+      <div class="grid grid-cols-7 text-center text-[11px] text-gray-400 mb-1">
+        ${['日','一','二','三','四','五','六'].map(label => `<span class="py-1">${label}</span>`).join('')}
+      </div>
+      <div class="grid grid-cols-7 gap-1 text-center">${blanks}${days}</div>
+      <div class="flex items-center justify-between mt-4 pt-3 border-t border-gray-100">
+        <button id="date-picker-cancel" type="button" class="px-3 py-1.5 text-sm text-gray-500 hover:text-gray-700">取消</button>
+        <button id="date-picker-today" type="button" class="px-3 py-1.5 text-sm font-semibold text-green-600 hover:bg-green-50 rounded-lg" data-date="${today}">今天</button>
+      </div>
     </div>
   </div>`;
 }
@@ -495,7 +552,7 @@ function safeExternalUrl(value) {
 function renderItems() {
   const {items} = S.act;
   const unc   = items.filter(i => i.claimers.length===0).length;
-  const noAmt = items.filter(i => i.amount===0).length;
+  const noAmt = items.filter(i => !hasAmount(i.amount)).length;
   const statusBanner = (unc>0||noAmt>0)
     ? `<div class="mb-4 p-3 bg-amber-50 border border-amber-200 rounded-xl text-xs text-amber-700 flex gap-2"><span>⚠️</span><span>${[unc>0?`<b>${unc}</b> 個品項待認領`:'', noAmt>0?`<b>${noAmt}</b> 個品項待填金額`:''].filter(Boolean).join(' ・ ')}</span></div>`
     : '<div class="mb-4 p-3 bg-green-50 border border-green-200 rounded-xl text-xs text-green-700">✅ 所有品項已認領並填妥金額，可查看結算囉！</div>';
@@ -505,7 +562,7 @@ function renderItems() {
     ? `<div class="mb-4 bg-green-50 border border-green-200 rounded-2xl p-4 shadow-sm">
          <h3 class="font-semibold text-green-800 text-sm mb-2">🎒 我負責帶的品項</h3>
          ${myItems.length > 0 
-           ? `<ul class="list-disc list-inside text-sm text-green-700 space-y-1">${myItems.map(i => `<li>${escapeHtml(i.name)}</li>`).join('')}</ul>` 
+           ? `<ul class="space-y-1.5">${myItems.map(i => `<li><button type="button" class="my-item-link group w-full flex items-center justify-between gap-2 px-3 py-2 text-sm text-left text-green-800 bg-white/70 border border-green-200 rounded-lg shadow-sm hover:bg-white hover:border-green-400 active:scale-[0.99] focus:outline-none focus-visible:ring-2 focus-visible:ring-green-400 transition-all" data-id="${escapeHtml(i.id)}"><span class="truncate">${escapeHtml(i.name)}</span><span class="text-sm text-green-500 flex-none group-hover:translate-x-0.5 transition-transform" aria-hidden="true">→</span></button></li>`).join('')}</ul>`
            : `<p class="text-xs text-green-600/70">目前沒有需要帶的東西喔～</p>`}
        </div>`
     : '';
@@ -524,6 +581,7 @@ function renderItems() {
 
 function renderCard(it) {
   const isExp = S.expandedItem === it.id;
+  const isEditingName = S.editingItemName === it.id;
   // Compact claimer mini-avatars
   const avatars = it.claimers.length
     ? `<div class="flex gap-1 flex-wrap justify-end">` + it.claimers.map(c => `<span class="px-2 h-5 rounded-full bg-gradient-to-br ${getColor(c)} flex items-center justify-center text-white text-[10px] font-bold whitespace-nowrap shadow-sm">${escapeHtml(c)}</span>`).join('') + `</div>`
@@ -540,7 +598,7 @@ function renderCard(it) {
   }).join('');
 
   const expanded = isExp ? `
-    <div class="mt-2.5 pt-2.5 border-t border-gray-100 slide">
+    <div class="mt-2.5 pt-2.5 border-t border-gray-100">
       <div class="flex justify-between items-center mb-1.5">
         <p class="text-[11px] text-gray-400 font-medium">指派認領人</p>
         <button class="item-del text-[11px] text-red-400 hover:text-red-600 flex items-center gap-1 px-1.5 py-0.5 rounded hover:bg-red-50 transition-colors" data-id="${it.id}">✕ 刪除品項</button>
@@ -561,7 +619,7 @@ function renderCard(it) {
           <p class="text-[11px] text-gray-400 mb-0.5">金額</p>
           <div class="flex">
             <span class="px-1.5 bg-gray-100 border border-r-0 border-gray-200 rounded-l-lg text-gray-400 text-xs flex items-center">$</span>
-            <input type="number" min="0" step="1" placeholder="0" value="${it.amount>0?it.amount:''}"
+            <input type="number" min="0" step="1" placeholder="-" value="${hasAmount(it.amount)?it.amount:''}"
               class="amount-inp flex-1 px-2 py-1.5 bg-gray-50 border border-gray-200 rounded-r-lg text-xs w-0" data-id="${it.id}">
           </div>
         </div>
@@ -575,12 +633,16 @@ function renderCard(it) {
       <span class="drag-handle text-gray-300 hover:text-green-500 cursor-grab p-1 -ml-1 select-none flex-shrink-0" title="拖曳排序" aria-hidden="true">
         <svg class="w-4 h-4 pointer-events-none" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 8h16M4 16h16"></path></svg>
       </span>
-      ${isExp ? `<input type="text" class="item-name-inp font-semibold text-gray-800 bg-white border border-green-400 focus:outline-none focus:ring-1 focus:ring-green-400 rounded px-1.5 py-0.5 text-sm w-full" value="${escapeHtml(it.name)}" data-id="${it.id}">` : `<span class="font-semibold text-gray-800 text-sm truncate">${escapeHtml(it.name)}</span>`}
+      ${isEditingName
+        ? `<input type="text" class="item-name-inp h-7 font-semibold text-gray-800 bg-white border border-green-400 focus:outline-none focus:ring-1 focus:ring-green-400 rounded px-1.5 text-sm w-full" value="${escapeHtml(it.name)}" data-id="${it.id}">`
+        : isExp
+          ? `<button type="button" class="item-name-edit h-7 px-1.5 font-semibold text-gray-800 text-sm truncate text-left hover:text-green-700 focus:outline-none focus-visible:ring-2 focus-visible:ring-green-400 rounded" data-id="${it.id}" title="編輯品項名稱">${escapeHtml(it.name)}</button>`
+          : `<span class="font-semibold text-gray-800 text-sm truncate">${escapeHtml(it.name)}</span>`}
       <div class="flex -space-x-1 flex-shrink-0 max-w-20 overflow-hidden">${avatars}</div>
     </div>
     <div class="flex items-center gap-1.5 flex-shrink-0">
       ${it.payer ? `<span class="text-[10px] text-gray-400 hidden sm:inline">付:${escapeHtml(it.payer)}</span>` : ''}
-      ${it.amount > 0 ? `<span class="font-bold text-gray-700 text-sm">${fmt(it.amount)}</span>` : '<span class="text-xs text-gray-300">-</span>'}
+      ${hasAmount(it.amount) ? `<span class="font-bold text-gray-700 text-sm">${fmt(it.amount)}</span>` : '<span class="text-xs text-gray-300">-</span>'}
       <span class="text-gray-300 text-[10px] ml-0.5">${isExp ? '▲' : '▼'}</span>
     </div>
   </div>
@@ -622,9 +684,9 @@ function renderSettle() {
     ? `<div class="bg-white rounded-2xl p-4 shadow-sm border border-gray-100"><div class="flex justify-between items-center mb-3"><h3 class="font-semibold text-gray-700 text-sm">💸 付款方式（最少次數）</h3>${shareBtn}</div><div class="space-y-2">${txns.map(t => `<div class="flex items-center gap-3 p-3 bg-gray-50 rounded-xl"><div class="w-7 h-7 rounded-full bg-gradient-to-br ${getColor(t.from)} flex items-center justify-center text-white text-xs font-bold flex-shrink-0">${escapeHtml(t.from.charAt(0))}</div><div class="flex-1 text-sm text-gray-600"><span class="font-semibold text-gray-800">${escapeHtml(t.from)}</span><span class="mx-1.5 text-gray-300">→</span><span class="font-semibold text-gray-800">${escapeHtml(t.to)}</span></div><span class="font-bold text-gray-800">${fmt(t.amt)}</span></div>`).join('')}</div></div>`
     : `<div class="bg-green-50 border border-green-200 rounded-2xl p-4 relative"><div class="absolute top-3 right-3">${shareBtnLight}</div><div class="text-center pt-2"><div class="text-4xl mb-2">🎉</div><p class="text-green-700 text-sm font-semibold">費用已均攤，不需要額外匯款！</p></div></div>`;
 
-  const hasAmtItems = S.act.items.filter(i=>i.amount>0);
-  const itemsDetailHtml = hasAmtItems.length
-    ? `<div class="space-y-1.5">${hasAmtItems.map(i=>{
+  const pricedItems = S.act.items.filter(i => hasAmount(i.amount));
+  const itemsDetailHtml = pricedItems.length
+    ? `<div class="space-y-1.5">${pricedItems.map(i=>{
         const payerLabel = i.payer ? `<span class="text-xs text-gray-400 ml-2">by ${escapeHtml(i.payer)}</span>` : '';
         const claimLabel = (i.sharers && i.sharers.length < S.act.members.length) ? `<span class="text-xs text-blue-400 ml-1">(由 ${i.sharers.map(escapeHtml).join(', ')} 分攤)</span>` : '';
         return `<div class="flex justify-between items-center py-1.5 border-b border-gray-50 last:border-0 text-sm"><div><span class="text-gray-700">${escapeHtml(i.name)}</span>${payerLabel}${claimLabel}</div><span class="font-semibold text-gray-700 flex-shrink-0 ml-2">${fmt(i.amount)}</span></div>`;
@@ -700,11 +762,31 @@ function bind() {
     if(!S.act.schedule) S.act.schedule=[];
     S.act.schedule.push({date, time:'', location:'', title:'', locationUrl:''});
     S.scheduleDateDraft = null;
+    S.datePickerOpen = false;
     render();
     await saveSchedule();
   };
-  on('new-schedule-date', 'change', e => { S.scheduleDateDraft = e.target.value; });
-  on('btn-add-sch', 'click', () => addScheduleOnDate($e('new-schedule-date')?.value));
+  on('btn-add-sch', 'click', () => {
+    S.datePickerMonth = nextScheduleDate().slice(0, 7);
+    S.datePickerOpen = true;
+    render();
+  });
+  document.querySelectorAll('.date-picker-nav').forEach(btn => {
+    btn.addEventListener('click', e => {
+      const [year, month] = S.datePickerMonth.split('-').map(Number);
+      const next = new Date(year, month - 1 + Number(e.currentTarget.dataset.offset), 1);
+      S.datePickerMonth = `${next.getFullYear()}-${String(next.getMonth() + 1).padStart(2, '0')}`;
+      render();
+    });
+  });
+  document.querySelectorAll('.date-picker-day').forEach(btn => {
+    btn.addEventListener('click', e => addScheduleOnDate(e.currentTarget.dataset.date));
+  });
+  on('date-picker-today', 'click', e => addScheduleOnDate(e.currentTarget.dataset.date));
+  on('date-picker-cancel', 'click', () => { S.datePickerOpen = false; render(); });
+  on('date-picker-overlay', 'click', e => {
+    if (e.target === e.currentTarget) { S.datePickerOpen = false; render(); }
+  });
   document.querySelectorAll('.sch-add-on-date').forEach(btn => {
     btn.addEventListener('click', e => addScheduleOnDate(e.currentTarget.dataset.date));
   });
@@ -749,6 +831,7 @@ document.querySelectorAll('.sch-time, .sch-location, .sch-title, .sch-location-u
   
   document.querySelectorAll('.sch-del').forEach(el => {
     el.addEventListener('click', async e => {
+      if (!confirm('確定要刪除此行程嗎？')) return;
       const idx = e.target.dataset.idx;
       S.act.schedule.splice(idx, 1);
       render();
@@ -779,13 +862,13 @@ document.querySelectorAll('.sch-time, .sch-location, .sch-title, .sch-location-u
     }
   });
   on('tab-settle','click', () => { S.tab='settlement'; render(); });
-  on('btn-refresh','click',() => { if(S.actId) loadAct(S.actId); });
+  on('btn-to-top','click',() => window.scrollTo({ top: 0, behavior: 'smooth' }));
 
   // add item in activity
   const doAddItem = async () => {
     const inp=$e('new-item'), name=inp?.value?.trim(); if(!name) return; inp.value='';
     const tmpId='tmp_'+Date.now(); 
-    S.act.items.push({id:tmpId,name,claimers:[],payer:'',amount:0, sharers:null}); render();
+    S.act.items.push({id:tmpId,name,claimers:[],payer:'',amount:null, sharers:null}); render();
     
     S.syncing = (S.syncing || 0) + 1; S.lastWriteTime = Date.now(); // BUG FIX 4
     try { 
@@ -802,6 +885,28 @@ document.querySelectorAll('.sch-time, .sch-location, .sch-title, .sch-location-u
   on('new-item','keydown', e => { if(e.key==='Enter') doAddItem(); });
 
   // row toggle expand/collapse
+
+  document.querySelectorAll('.my-item-link').forEach(btn => {
+    btn.addEventListener('click', e => {
+      const id = e.currentTarget.dataset.id;
+      S.expandedItem = id;
+      S.editingItemName = null;
+      render();
+      requestAnimationFrame(() => {
+        const card = Array.from(document.querySelectorAll('[data-item-id]'))
+          .find(el => String(el.dataset.itemId) === String(id));
+        if (!card) return;
+        const headerHeight = $e('activity-header')?.getBoundingClientRect().height || 0;
+        const targetTop = card.getBoundingClientRect().top + window.scrollY - headerHeight - 12;
+        window.scrollTo({ top: Math.max(0, targetTop), behavior: 'smooth' });
+        card.animate?.([
+          { boxShadow: '0 0 0 2px rgba(34, 197, 94, 0.65)' },
+          { boxShadow: '0 0 0 7px rgba(34, 197, 94, 0)' },
+          { boxShadow: '0 0 0 2px rgba(34, 197, 94, 0)' }
+        ], { duration: 1000, easing: 'ease-out' });
+      });
+    });
+  });
   
   const itemList = $e('item-list-container');
   if (itemList && window.Sortable) {
@@ -828,7 +933,21 @@ document.querySelectorAll('.sch-time, .sch-location, .sch-title, .sch-location-u
       if (e.target.closest('input, select, button, label, .drag-handle')) return;
       const id = e.currentTarget.dataset.id;
       S.expandedItem = S.expandedItem === id ? null : id;
+      S.editingItemName = null;
       render();
+    });
+  });
+
+  document.querySelectorAll('.item-name-edit').forEach(btn => {
+    btn.addEventListener('click', e => {
+      e.stopPropagation();
+      S.editingItemName = e.currentTarget.dataset.id;
+      render();
+      requestAnimationFrame(() => {
+        const input = document.querySelector(`.item-name-inp[data-id="${S.editingItemName}"]`);
+        input?.focus();
+        input?.select();
+      });
     });
   });
 
@@ -840,10 +959,12 @@ document.querySelectorAll('.sch-time, .sch-location, .sch-title, .sch-location-u
       const member = e.currentTarget.dataset.member;
       const item = S.act?.items?.find(i => String(i.id) === String(itemId));
       if (!item) return;
-      const nc = item.claimers.includes(member)
+      const isAssigning = !item.claimers.includes(member);
+      const nc = !isAssigning
         ? item.claimers.filter(c => c !== member)
         : [...item.claimers, member];
-      const nEl=document.querySelector(`.item-name-inp[data-id="${itemId}"]`); await updateItemRemote(itemId, nEl?nEl.value:item.name, nc, item.payer, item.amount, item.sharers);
+      const payer = isAssigning && !item.payer ? member : item.payer;
+      const nEl=document.querySelector(`.item-name-inp[data-id="${itemId}"]`); await updateItemRemote(itemId, nEl?nEl.value:item.name, nc, payer, item.amount, item.sharers);
     });
   });
 
@@ -893,7 +1014,8 @@ document.querySelectorAll('.sch-time, .sch-location, .sch-title, .sch-location-u
       const id=e.currentTarget.dataset.id, card=e.currentTarget.closest('[data-item-id]');
       const amtEl=card?.querySelector('.amount-inp'), item=S.act?.items?.find(i=>String(i.id)===String(id));
       if(!item) return;
-      const nEl=card?.querySelector(".item-name-inp"); await updateItemRemote(id, nEl?nEl.value:item.name, item.claimers, e.currentTarget.value, amtEl?+amtEl.value:item.amount, item.sharers, false);
+      const amount = amtEl ? (amtEl.value === '' ? null : Number(amtEl.value)) : item.amount;
+      const nEl=card?.querySelector(".item-name-inp"); await updateItemRemote(id, nEl?nEl.value:item.name, item.claimers, e.currentTarget.value, amount, item.sharers, false);
     });
   });
 
@@ -905,10 +1027,20 @@ document.querySelectorAll('.sch-time, .sch-location, .sch-title, .sch-location-u
       const item=S.act?.items?.find(i=>String(i.id)===String(id));
       if(!item) return;
       const val = e.currentTarget.value.trim();
-      if (val === item.name || !val) return;
-      await updateItemRemote(id, val, item.claimers, payerEl?payerEl.value:item.payer, amtEl?+amtEl.value:item.amount, item.sharers, false);
+      S.editingItemName = null;
+      if (val === item.name || !val) { setTimeout(() => render(), 0); return; }
+      const amount = amtEl ? (amtEl.value === '' ? null : Number(amtEl.value)) : item.amount;
+      await updateItemRemote(id, val, item.claimers, payerEl?payerEl.value:item.payer, amount, item.sharers, false);
+      render();
     });
-    inp.addEventListener('keydown', e => { if(e.key==='Enter') e.target.blur(); });
+    inp.addEventListener('keydown', e => {
+      if(e.key==='Enter') e.target.blur();
+      if(e.key==='Escape') {
+        const item = S.act?.items?.find(i => String(i.id) === String(e.currentTarget.dataset.id));
+        if (item) e.currentTarget.value = item.name;
+        e.currentTarget.blur();
+      }
+    });
   });
 
   // amount input — save on blur
@@ -917,12 +1049,19 @@ document.querySelectorAll('.sch-time, .sch-location, .sch-title, .sch-location-u
       const id=e.currentTarget.dataset.id, card=e.currentTarget.closest('[data-item-id]');
       const payerEl=card?.querySelector('.payer-sel'), item=S.act?.items?.find(i=>String(i.id)===String(id));
       if(!item) return;
-      const nEl=card?.querySelector(".item-name-inp"); await updateItemRemote(id, nEl?nEl.value:item.name, item.claimers, payerEl?payerEl.value:item.payer, +e.currentTarget.value||0, item.sharers, false);
+      const amount = e.currentTarget.value === '' ? null : Number(e.currentTarget.value);
+      const nEl=card?.querySelector(".item-name-inp"); await updateItemRemote(id, nEl?nEl.value:item.name, item.claimers, payerEl?payerEl.value:item.payer, amount, item.sharers, false);
     });
     inp.addEventListener('keydown', e => { if(e.key==='Enter') e.target.blur(); });
   });
 
-
+  document.onclick = e => {
+    if (!S.expandedItem || !(e.target instanceof Element)) return;
+    if (e.target.closest('[data-item-id], .my-item-link')) return;
+    S.expandedItem = null;
+    S.editingItemName = null;
+    render();
+  };
 }
 
 function bindCreate() {

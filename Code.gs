@@ -64,7 +64,7 @@ function ensureSchema(ss) {
   let items = ss.getSheetByName('items');
   if (!items) {
     items = ss.insertSheet('items');
-    items.appendRow(['activityId', 'itemId', 'name', 'claimers', 'payer', 'amount', 'sharers', 'updatedAt']);
+    items.appendRow(['activityId', 'itemId', 'name', 'claimers', 'payer', 'amount', 'sharers', 'updatedAt', 'amountSet']);
     items.setColumnWidth(1, 100);
     items.setColumnWidth(2, 90);
     items.setColumnWidth(3, 180);
@@ -73,9 +73,10 @@ function ensureSchema(ss) {
     items.setColumnWidth(6, 80);
     items.setColumnWidth(7, 150);
     items.setColumnWidth(8, 180);
-    styleHeader(items, 8);
+    items.setColumnWidth(9, 90);
+    styleHeader(items, 9);
   } else {
-    ensureHeader(items, ['activityId', 'itemId', 'name', 'claimers', 'payer', 'amount', 'sharers', 'updatedAt']);
+    ensureHeader(items, ['activityId', 'itemId', 'name', 'claimers', 'payer', 'amount', 'sharers', 'updatedAt', 'amountSet']);
   }
 }
 
@@ -101,10 +102,13 @@ function readItems(ss, activityId) {
   const items = [];
   for (let i = 1; i < rows.length; i++) {
     if (String(rows[i][0]) !== String(activityId) || !rows[i][1]) continue;
+    // 舊資料沒有 amountSet；非零金額視為已填，舊的 0 則維持「未填」。
+    const amountSet = rows[i][8] === true || String(rows[i][8]).toLowerCase() === 'true' ||
+      (rows[i][8] === '' && rows[i][5] !== '' && Number(rows[i][5]) !== 0);
     items.push({
       id: String(rows[i][1]), name: String(rows[i][2]),
       claimers: safeJSON(rows[i][3], []),
-      payer: String(rows[i][4] || ''), amount: Number(rows[i][5]) || 0,
+      payer: String(rows[i][4] || ''), amount: amountSet ? Number(rows[i][5]) || 0 : null,
       sharers: safeJSON(rows[i][6], null)
     });
   }
@@ -134,11 +138,11 @@ function migrateLegacyActivityIfNeeded(ss, activityInfo, lockAlreadyHeld) {
           String(latest.values[0]), String(rows[i][0]), String(rows[i][1]),
           JSON.stringify(safeJSON(rows[i][2], [])), String(rows[i][3] || ''),
           Number(rows[i][4]) || 0, JSON.stringify(safeJSON(rows[i][5], null)),
-          new Date().toISOString()
+          new Date().toISOString(), Number(rows[i][4]) !== 0
         ]);
       }
       if (migratedRows.length) {
-        itemSheet.getRange(itemSheet.getLastRow() + 1, 1, migratedRows.length, 8).setValues(migratedRows);
+        itemSheet.getRange(itemSheet.getLastRow() + 1, 1, migratedRows.length, 9).setValues(migratedRows);
       }
     }
     getActivitiesSheet(ss).getRange(latest.row, 6).setValue('central-v1');
@@ -229,7 +233,8 @@ function doPost(e) {
         case 'updateItem':     return handleUpdateItem(body);
         case 'addItem':        return handleAddItem(body);
         case 'deleteItem':     return handleDeleteItem(body);
-          case 'updateSchedule': return handleUpdateSchedule(body);
+        case 'updateSchedule': return handleUpdateSchedule(body);
+        case 'reorderItems':   return handleReorderItems(body);
         default: return respond({ error: 'Unknown action: ' + body.action });
       }
     } finally {
@@ -277,11 +282,11 @@ function handleCreate(body) {
   activitiesSheet.appendRow([actId, String(name).trim(), JSON.stringify(normalMembers), now, '[]', 'central-v1']);
 
   const itemRows = normalItems.map(itemName => [
-    actId, generateId(6), itemName, '[]', '', 0, 'null', now
+    actId, generateId(6), itemName, '[]', '', '', 'null', now, false
   ]);
   if (itemRows.length) {
     const itemsSheet = getItemsSheet(ss);
-    itemsSheet.getRange(itemsSheet.getLastRow() + 1, 1, itemRows.length, 8).setValues(itemRows);
+    itemsSheet.getRange(itemsSheet.getLastRow() + 1, 1, itemRows.length, 9).setValues(itemRows);
   }
 
   return respond({ success: true, activityId: actId });
@@ -323,7 +328,8 @@ function handleUpdateItem(body) {
   const validPayer = !payer || members.includes(payer);
   const validSharers = !sharers || (sharers.length > 0 && sharers.every(m => members.includes(m)));
   if (!validClaimers || !validPayer || !validSharers) return respond({ error: '認領人、代墊人與分攤人必須是活動成員' });
-  if (!Number.isFinite(Number(amount)) || Number(amount) < 0) return respond({ error: '金額必須是非負數字' });
+  const amountSet = amount !== null && amount !== undefined && amount !== '';
+  if (amountSet && (!Number.isFinite(Number(amount)) || Number(amount) < 0)) return respond({ error: '金額必須是非負數字' });
   if (name !== undefined && !String(name).trim()) return respond({ error: '品項名稱不可空白' });
   if (name !== undefined && String(name).trim().length > 100) return respond({ error: '品項名稱最多 100 字' });
 
@@ -331,9 +337,9 @@ function handleUpdateItem(body) {
   const rows = sheet.getDataRange().getValues();
   for (let i = 1; i < rows.length; i++) {
     if (String(rows[i][0]) === String(activityId) && String(rows[i][1]) === String(itemId)) {
-      sheet.getRange(i + 1, 3, 1, 6).setValues([[
+      sheet.getRange(i + 1, 3, 1, 7).setValues([[
         String(name === undefined ? rows[i][2] : name).trim(), JSON.stringify(claimers), payer || '',
-        Number(amount) || 0, JSON.stringify(sharers || null), new Date().toISOString()
+        amountSet ? Number(amount) : '', JSON.stringify(sharers || null), new Date().toISOString(), amountSet
       ]]);
       return respond({ success: true });
     }
@@ -355,7 +361,7 @@ function handleAddItem(body) {
     return respond({ error: '已有相同名稱的品項' });
   }
   const itemId = generateId(6);
-  getItemsSheet(ss).appendRow([activityId, itemId, String(name).trim(), '[]', '', 0, 'null', new Date().toISOString()]);
+  getItemsSheet(ss).appendRow([activityId, itemId, String(name).trim(), '[]', '', '', 'null', new Date().toISOString(), false]);
 
   return respond({ success: true, itemId });
 }
