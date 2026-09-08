@@ -26,7 +26,7 @@
 ### Step 2：維護者設定前端（只需一次）
 
 1. 開啟 `app-config.js`，設定各前端網域對應的 Apps Script Web App URL。
-2. 將 `index.html` 與 `app-config.js` 一起上傳到靜態網站。
+2. 將 `index.html`、`app-config.js`、`manifest.webmanifest` 與完整的 `icons` 資料夾一起上傳到靜態網站。
 3. 一般使用者直接開啟網站或分享連結即可使用，**不需要** Google 帳號、Apps Script 或 API 設定。
 
 > 維護者若要測試或暫時改用另一組 API，可在網址後加上 `?setup=1` 開啟設定頁；這只影響自己的瀏覽器。
@@ -63,7 +63,8 @@
 
 ## 結算邏輯
 
-- 所有費用由全體成員**平均分攤**
+- 金額以新台幣整元儲存；輸入小數時會**無條件進位**
+- 所有費用由指定分攤人平均分攤；無法整除的整元餘額依分攤人順序分配，總額不會產生小數或誤差
 - 代墊金額 - 均攤金額 = 餘額
   - 正值 → 收回（別人要付你錢）
   - 負值 → 應付（你要付錢給別人）
@@ -86,6 +87,7 @@
 `
 app-config.js       (依前端網域選擇 master / dev API)
 index.html          (前端，可本機直接開啟或部署靜態站台)
+manifest.webmanifest、icons/（PWA 安裝資訊與各尺寸圖示）
   │
   │ HTTP (fetch)
   ▼
@@ -122,12 +124,12 @@ Google Sheets       (資料庫，結構化儲存活動與品項資料)
 取得固定網址，方便分享：
 
 **Cloudflare Pages（推薦，免費）**
-1. 把 `index.html` 與 `app-config.js` 上傳到 GitHub Repo
+1. 把 `index.html`、`app-config.js`、`manifest.webmanifest` 與 `icons` 資料夾上傳到 GitHub Repo
 2. 到 [pages.cloudflare.com](https://pages.cloudflare.com) 連結 Repo
 3. 部署後取得 xxx.pages.dev 網址
 
 **GitHub Pages（免費）**
-1. 在 GitHub 建立 Repo，上傳 `index.html` 與 `app-config.js`
+1. 在 GitHub 建立 Repo，上傳 `index.html`、`app-config.js`、`manifest.webmanifest` 與 `icons` 資料夾
 2. 到 Repo Settings → Pages → 選擇 Branch
 3. 部署後取得 username.github.io/reponame 網址
 

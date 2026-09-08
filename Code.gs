@@ -108,7 +108,7 @@ function readItems(ss, activityId) {
     items.push({
       id: String(rows[i][1]), name: String(rows[i][2]),
       claimers: safeJSON(rows[i][3], []),
-      payer: String(rows[i][4] || ''), amount: amountSet ? Number(rows[i][5]) || 0 : null,
+      payer: String(rows[i][4] || ''), amount: amountSet ? Math.ceil(Number(rows[i][5]) || 0) : null,
       sharers: safeJSON(rows[i][6], null)
     });
   }
@@ -339,7 +339,7 @@ function handleUpdateItem(body) {
     if (String(rows[i][0]) === String(activityId) && String(rows[i][1]) === String(itemId)) {
       sheet.getRange(i + 1, 3, 1, 7).setValues([[
         String(name === undefined ? rows[i][2] : name).trim(), JSON.stringify(claimers), payer || '',
-        amountSet ? Number(amount) : '', JSON.stringify(sharers || null), new Date().toISOString(), amountSet
+        amountSet ? Math.ceil(Number(amount)) : '', JSON.stringify(sharers || null), new Date().toISOString(), amountSet
       ]]);
       return respond({ success: true });
     }

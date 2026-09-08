@@ -4,7 +4,10 @@
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <title>一起出遊</title>
-  <link rel="icon" href="data:image/svg+xml,<svg xmlns=%22http://www.w3.org/2000/svg%22 viewBox=%220 0 100 100%22><text y=%22.9em%22 font-size=%2290%22>🏕️</text></svg>">
+  <meta name="theme-color" content="#16a34a">
+  <link rel="manifest" href="./manifest.webmanifest">
+  <link rel="icon" type="image/svg+xml" href="./icons/app-icon.svg">
+  <link rel="apple-touch-icon" sizes="180x180" href="./icons/app-icon-180.png">
   <script src="https://cdn.tailwindcss.com"></script>
   <link href="https://fonts.googleapis.com/css2?family=Noto+Sans+TC:wght@400;500;700&display=swap" rel="stylesheet">
   <style>
@@ -39,6 +42,19 @@
     input[type="time"]::-webkit-date-and-time-value {
       text-align: left;
     }
+
+    /* 拖曳中的品項以灰底、陰影呈現「被拿起來」的狀態。 */
+    .sortable-lifted,
+    .sortable-dragging {
+      background: #f3f4f6 !important;
+      box-shadow: 0 12px 26px rgba(15, 23, 42, 0.18) !important;
+      transform: translateY(-2px) scale(1.01);
+      transition: box-shadow 120ms ease, transform 120ms ease, background-color 120ms ease;
+    }
+    .sortable-ghost {
+      opacity: 0.38;
+      background: #e5e7eb !important;
+    }
 </style>
   <script src="./app-config.js"></script>
   <script src="https://cdn.jsdelivr.net/npm/sortablejs@1.15.2/Sortable.min.js"></script>
@@ -48,7 +64,7 @@
 <script>
 // ── utils ──────────────────────────────────────────────────────────
 const $e = id => document.getElementById(id);
-const fmt = n => '$' + (+n || 0).toLocaleString('zh-TW', {maximumFractionDigits:2});
+const fmt = n => '$' + Math.ceil(+n || 0).toLocaleString('zh-TW', {maximumFractionDigits:0});
 const hasAmount = value => value !== null && value !== undefined && value !== '';
 const escapeHtml = value => String(value ?? '').replace(/[&<>"']/g, ch => ({
   '&':'&amp;', '<':'&lt;', '>':'&gt;', '"':'&quot;', "'":'&#39;'
@@ -179,7 +195,7 @@ async function saveSchedule() {
 
 async function updateItemRemote(itemId, name, claimers, payer, amount, sharers, shouldRender = true) {
   const item = S.act?.items?.find(i => String(i.id) === String(itemId));
-  const normalizedAmount = hasAmount(amount) ? Number(amount) : null;
+  const normalizedAmount = hasAmount(amount) ? Math.ceil(Number(amount)) : null;
   if (item) { 
     if(name) item.name=name;
     item.claimers=claimers; item.payer=payer; item.amount=normalizedAmount;
@@ -203,41 +219,39 @@ async function updateItemRemote(itemId, name, claimers, payer, amount, sharers, 
 function calcSettlement() {
   if (!S.act) return null;
   const {members,items} = S.act;
-  const paidCents = {}; const balCents = {};
-  members.forEach(m => { paidCents[m]=0; balCents[m]=0; });
-  let totalCents = 0;
+  const paid = {}; const bal = {};
+  members.forEach(m => { paid[m]=0; bal[m]=0; });
+  let total = 0;
   
   items.forEach(it => {
     if (it.payer && hasAmount(it.amount) && it.amount > 0) {
-      const amountCents = Math.round(Number(it.amount) * 100);
-      paidCents[it.payer] = (paidCents[it.payer]||0) + amountCents;
-      balCents[it.payer] = (balCents[it.payer]||0) + amountCents;
-      totalCents += amountCents;
+      const amount = Math.ceil(Number(it.amount));
+      paid[it.payer] = (paid[it.payer]||0) + amount;
+      bal[it.payer] = (bal[it.payer]||0) + amount;
+      total += amount;
 
       const sh = it.sharers || members;
       if (sh.length > 0) {
-        // 以「分」運算，無法整除的餘額依分攤人目前順序各加一分，
+        // 以整元運算，無法整除的餘額依分攤人目前順序各加一元，
         // 確保建議匯款加總永遠等於原始金額。
-        const base = Math.floor(amountCents / sh.length);
-        const remainder = amountCents % sh.length;
-        sh.forEach((m, index) => { balCents[m] = (balCents[m]||0) - base - (index < remainder ? 1 : 0); });
+        const base = Math.floor(amount / sh.length);
+        const remainder = amount % sh.length;
+        sh.forEach((m, index) => { bal[m] = (bal[m]||0) - base - (index < remainder ? 1 : 0); });
       }
     }
   });
-  const creditors = members.filter(m=>balCents[m]>0).map(m=>({name:m,amt:balCents[m]})).sort((a,b)=>b.amt-a.amt);
-  const debtors   = members.filter(m=>balCents[m]<0).map(m=>({name:m,amt:-balCents[m]})).sort((a,b)=>b.amt-a.amt);
+  const creditors = members.filter(m=>bal[m]>0).map(m=>({name:m,amt:bal[m]})).sort((a,b)=>b.amt-a.amt);
+  const debtors   = members.filter(m=>bal[m]<0).map(m=>({name:m,amt:-bal[m]})).sort((a,b)=>b.amt-a.amt);
   const txns = []; let ci=0,di=0;
   while (ci<creditors.length && di<debtors.length) {
     const amt = Math.min(creditors[ci].amt, debtors[di].amt);
-    if (amt>0) txns.push({from:debtors[di].name, to:creditors[ci].name, amt:amt/100});
+    if (amt>0) txns.push({from:debtors[di].name, to:creditors[ci].name, amt});
     creditors[ci].amt -= amt; debtors[di].amt -= amt;
     if (creditors[ci].amt === 0) ci++;
     if (debtors[di].amt === 0) di++;
   }
-  const paid = Object.fromEntries(members.map(m => [m, paidCents[m] / 100]));
-  const bal = Object.fromEntries(members.map(m => [m, balCents[m] / 100]));
-  const cost = Object.fromEntries(members.map(m => [m, (paidCents[m] - balCents[m]) / 100]));
-  return {total: totalCents / 100, paid, bal, cost, txns};
+  const cost = Object.fromEntries(members.map(m => [m, paid[m] - bal[m]]));
+  return {total, paid, bal, cost, txns};
 }
 
 // ── render ─────────────────────────────────────────────────────────
@@ -392,7 +406,10 @@ function renderActivity() {
   </div>
   ${S.tab === 'schedule' ? renderSchedule() : S.tab === 'items' ? renderItems() : renderSettle()}
   </div>
-  <div class="fixed bottom-8 right-4 z-30">
+  <div class="fixed bottom-8 right-4 z-30 flex flex-col gap-3">
+    <button id="btn-home" type="button" aria-label="回到首頁" title="回到首頁" class="w-12 h-12 bg-white text-green-600 shadow-lg rounded-full flex items-center justify-center active:scale-90 transition-all hover:bg-green-50">
+      <svg class="w-6 h-6" fill="none" stroke="currentColor" viewBox="0 0 24 24" aria-hidden="true"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M3 11.5 12 4l9 7.5M5.5 10v9h13v-9M9 19v-5h6v5"></path></svg>
+    </button>
     <button id="btn-to-top" type="button" aria-label="回到頂端" title="回到頂端" class="w-12 h-12 bg-white text-green-600 shadow-lg rounded-full flex items-center justify-center active:scale-90 transition-all hover:bg-green-50">
       <svg class="w-6 h-6" fill="none" stroke="currentColor" viewBox="0 0 24 24" aria-hidden="true"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M5 15l7-7 7 7"></path></svg>
     </button>
@@ -862,6 +879,7 @@ document.querySelectorAll('.sch-time, .sch-location, .sch-title, .sch-location-u
     }
   });
   on('tab-settle','click', () => { S.tab='settlement'; render(); });
+  on('btn-home','click',goHome);
   on('btn-to-top','click',() => window.scrollTo({ top: 0, behavior: 'smooth' }));
 
   // add item in activity
@@ -913,7 +931,9 @@ document.querySelectorAll('.sch-time, .sch-location, .sch-title, .sch-location-u
     Sortable.create(itemList, {
       animation: 150,
       handle: '.drag-handle',
-      ghostClass: 'opacity-50',
+      chosenClass: 'sortable-lifted',
+      dragClass: 'sortable-dragging',
+      ghostClass: 'sortable-ghost',
       onEnd: async (evt) => {
         if (evt.oldIndex === evt.newIndex) return;
         const item = S.act.items.splice(evt.oldIndex, 1)[0];
@@ -1110,7 +1130,11 @@ function bindChips() {
   });
 }
 
-function goHome() { S.page='home'; S.act=null; S.actId=null; history.pushState({},'',location.pathname); render(); }
+function goHome() {
+  S.page='home'; S.act=null; S.actId=null;
+  S.expandedItem=null; S.editingItemName=null; S.datePickerOpen=false;
+  history.pushState({},'',location.pathname); render();
+}
 
 function doJoin() {
   const id=$e('join-input')?.value?.trim();
