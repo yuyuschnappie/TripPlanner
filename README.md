@@ -25,8 +25,8 @@
 
 ### Step 2：維護者設定前端（只需一次）
 
-1. 開啟 `index.html`，將 `DEFAULT_API_URL` 設為 Step 1 的 Web App URL。
-2. 將 `index.html` 上傳到靜態網站。
+1. 開啟 `app-config.js`，設定各前端網域對應的 Apps Script Web App URL。
+2. 將 `index.html` 與 `app-config.js` 一起上傳到靜態網站。
 3. 一般使用者直接開啟網站或分享連結即可使用，**不需要** Google 帳號、Apps Script 或 API 設定。
 
 > 維護者若要測試或暫時改用另一組 API，可在網址後加上 `?setup=1` 開啟設定頁；這只影響自己的瀏覽器。
@@ -84,6 +84,7 @@
 ## 架構
 
 `
+app-config.js       (依前端網域選擇 master / dev API)
 index.html          (前端，可本機直接開啟或部署靜態站台)
   │
   │ HTTP (fetch)
@@ -94,6 +95,17 @@ Google Apps Script  (免費 API，自動建立 Spreadsheet)
   ▼
 Google Sheets       (資料庫，結構化儲存活動與品項資料)
 `
+
+### 環境與連線設定
+
+`master` 與 `dev` 共用同一份 `app-config.js`，依 `location.hostname` 自動選擇環境，因此切換或合併 branch 時不需要修改 API URL。
+
+| 環境 | 前端網址 | Apps Script API |
+| --- | --- | --- |
+| master | `https://trip-planner.tsai212224.workers.dev/` | `AKfycbyg...SZlzk/exec` |
+| dev | `https://test.tsai212224.workers.dev/` | `AKfycbxsv...XeR1iQ/exec` |
+
+本機的 `localhost`、`127.0.0.1` 以及未知網域一律使用 dev API，避免測試時誤寫正式資料。
 
 ### Google Sheets 資料結構
 
@@ -110,12 +122,12 @@ Google Sheets       (資料庫，結構化儲存活動與品項資料)
 取得固定網址，方便分享：
 
 **Cloudflare Pages（推薦，免費）**
-1. 把 index.html 上傳到 GitHub 任意 Repo
+1. 把 `index.html` 與 `app-config.js` 上傳到 GitHub Repo
 2. 到 [pages.cloudflare.com](https://pages.cloudflare.com) 連結 Repo
 3. 部署後取得 xxx.pages.dev 網址
 
 **GitHub Pages（免費）**
-1. 在 GitHub 建立 Repo，上傳 index.html
+1. 在 GitHub 建立 Repo，上傳 `index.html` 與 `app-config.js`
 2. 到 Repo Settings → Pages → 選擇 Branch
 3. 部署後取得 username.github.io/reponame 網址
 
@@ -124,7 +136,7 @@ Google Sheets       (資料庫，結構化儲存活動與品項資料)
 ## 注意事項
 
 - Apps Script 單次執行上限為 6 分鐘；實際可用量依 Google 帳號類型與每日配額而異。
-- 前端每 30 秒自動同步一次，也可按手動重新整理；一般小型群組足夠使用。
+- 前端每 30 秒自動同步一次；一般小型群組足夠使用。
 - 多人同時編輯同一品項時，後寫者仍可能覆蓋先寫者，請避免同時修改同一欄位。
 - 資料集中在固定的 `activities`、`items` 兩張表，不會為每個活動建立新分頁。
 - API 是公開 Web App；僅適合受信任的朋友／小型社群，勿用來存放敏感資料。

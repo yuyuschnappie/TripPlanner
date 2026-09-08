@@ -40,6 +40,7 @@
       text-align: left;
     }
 </style>
+  <script src="./app-config.js"></script>
   <script src="https://cdn.jsdelivr.net/npm/sortablejs@1.15.2/Sortable.min.js"></script>
 </head>
 <body>
@@ -53,9 +54,8 @@ const escapeHtml = value => String(value ?? '').replace(/[&<>"']/g, ch => ({
   '&':'&amp;', '<':'&lt;', '>':'&gt;', '"':'&quot;', "'":'&#39;'
 }[ch]));
 
-// 正式部署前只需由維護者填入一次。一般使用者不需要、也不應看見 API 設定。
-// Web App URL 不是祕密；請搭配後端的輸入驗證與使用量監控。
-const DEFAULT_API_URL = 'https://script.google.com/macros/s/AKfycbygKTfIk0pqval3Df8Y2Xj_HhJMpYCiu_FvZzyEQWEdXSoaEYhOoV3Ga-_yLqwSZlzk/exec';
+// API 連線由 app-config.js 依目前前端網域自動選擇 master 或 dev。
+const DEFAULT_API_URL = window.TRIP_PLANNER_CONFIG?.apiUrl || '';
 const DEV_SETTINGS = new URLSearchParams(location.search).get('setup') === '1';
 const COLORS = [
   'from-blue-500 to-cyan-600', 'from-purple-500 to-violet-600',
