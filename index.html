@@ -5,7 +5,7 @@
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <title>一起出遊</title>
   <meta name="theme-color" content="#16a34a">
-  <link rel="manifest" href="./manifest.webmanifest">
+  <link rel="manifest" href="./manifest.webmanifest?v=2">
   <link rel="icon" type="image/svg+xml" href="./icons/app-icon.svg">
   <link rel="apple-touch-icon" sizes="180x180" href="./icons/app-icon-180.png">
   <script src="https://cdn.tailwindcss.com"></script>
@@ -76,9 +76,9 @@ const DEV_SETTINGS = new URLSearchParams(location.search).get('setup') === '1';
 const COLORS = [
   'from-blue-500 to-cyan-600', 'from-purple-500 to-violet-600',
   'from-pink-500 to-rose-600', 'from-amber-500 to-orange-600',
-  'from-emerald-500 to-green-600', 'from-indigo-500 to-blue-600',
-  'from-fuchsia-500 to-purple-600', 'from-rose-500 to-red-600',
-  'from-cyan-600 to-teal-600', 'from-orange-500 to-red-500',
+  'from-emerald-500 to-green-600', 'from-slate-600 to-gray-800',
+  'from-lime-500 to-lime-700', 'from-cyan-500 to-teal-700',
+  'from-yellow-500 to-amber-600', 'from-red-500 to-red-700',
   'from-teal-500 to-emerald-600', 'from-violet-500 to-indigo-600',
   'from-sky-500 to-blue-600', 'from-lime-600 to-green-600',
   'from-red-500 to-rose-600', 'from-slate-500 to-gray-600'
@@ -276,16 +276,16 @@ function renderHome() {
   <div class="text-center mb-12">
     <div class="text-7xl mb-3">🏕️</div>
     <h1 class="text-3xl font-bold text-gray-800 mb-1">一起出遊</h1>
-    <p class="text-gray-400 text-sm">品項認領 ✦ 金流結算</p>
+    <p class="text-gray-400 text-sm">行程表 ✦ 品項認領 ✦ 金流結算</p>
   </div>
   <div class="space-y-4">
     <button id="btn-create" class="w-full py-4 bg-green-500 hover:bg-green-600 active:bg-green-700 text-white text-lg font-bold rounded-2xl shadow-md active:scale-95 transition-all">✨ 建立新活動</button>
     <div class="flex items-center gap-3 text-gray-300 text-xs">
       <div class="h-px flex-1 bg-gray-200"></div>或加入現有活動<div class="h-px flex-1 bg-gray-200"></div>
     </div>
-    <div class="flex gap-2">
-      <input id="join-input" type="text" placeholder="輸入活動代碼" class="flex-1 px-4 py-3 border-2 border-gray-100 rounded-xl text-gray-700 focus:outline-none focus:border-green-400 bg-white">
-      <button id="btn-join" class="px-5 py-3 bg-gray-800 text-white font-medium rounded-xl active:scale-95 transition-all">加入</button>
+    <div class="flex gap-2 min-w-0">
+      <input id="join-input" type="text" placeholder="輸入活動代碼" class="flex-1 min-w-0 w-0 px-4 py-3 border-2 border-[#666] rounded-xl text-gray-700 focus:outline-none focus:border-green-400 bg-white">
+      <button id="btn-join" class="flex-none shrink-0 whitespace-nowrap px-5 py-3 bg-gray-800 text-white font-medium rounded-xl active:scale-95 transition-all">加入</button>
     </div>
   </div>
   ${apiWarn}
@@ -928,9 +928,17 @@ document.querySelectorAll('.sch-time, .sch-location, .sch-title, .sch-location-u
   
   const itemList = $e('item-list-container');
   if (itemList && window.Sortable) {
+    const useLongPressSorting = window.matchMedia?.('(pointer: coarse)').matches;
     Sortable.create(itemList, {
       animation: 150,
-      handle: '.drag-handle',
+      // 手機可長按整列拖曳；滑鼠環境則維持使用左側排序把手。
+      handle: useLongPressSorting ? '.row-toggle' : '.drag-handle',
+      delay: useLongPressSorting ? 320 : 0,
+      delayOnTouchOnly: true,
+      touchStartThreshold: 5,
+      fallbackTolerance: 5,
+      filter: 'input, select, button, label',
+      preventOnFilter: false,
       chosenClass: 'sortable-lifted',
       dragClass: 'sortable-dragging',
       ghostClass: 'sortable-ghost',

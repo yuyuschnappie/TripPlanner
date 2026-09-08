@@ -2,7 +2,7 @@
   "name": "一起出遊",
   "short_name": "一起出遊",
   "description": "行程安排、品項認領與旅費結算",
-  "start_url": "./",
+  "id": "./",
   "scope": "./",
   "display": "standalone",
   "background_color": "#f0fdf4",
