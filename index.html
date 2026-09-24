@@ -55,6 +55,14 @@
       opacity: 0.38;
       background: #e5e7eb !important;
     }
+
+    /* 觸控裝置可能讓 :hover 停留；近期活動僅在真正有滑鼠時顯示滑過色。 */
+    @media (hover: hover) and (pointer: fine) {
+      .recent-activity:hover {
+        border-color: #4ade80;
+        background-color: #f0fdf4;
+      }
+    }
 </style>
   <script src="./app-config.js"></script>
   <script src="https://cdn.jsdelivr.net/npm/sortablejs@1.15.2/Sortable.min.js"></script>
@@ -296,7 +304,7 @@ function renderHome() {
     ? `<section class="mt-8">
         <h2 class="mb-3 text-sm font-bold text-gray-700">近期瀏覽過的活動</h2>
         <div class="space-y-2">
-          ${recentActivities.map(activity => `<button type="button" class="recent-activity w-full flex items-center justify-between gap-3 px-4 py-3 bg-white border border-gray-200 rounded-xl text-left shadow-sm hover:border-green-400 hover:bg-green-50 active:scale-[0.99] transition-all" data-id="${escapeHtml(activity.id)}">
+          ${recentActivities.map(activity => `<button type="button" class="recent-activity w-full flex items-center justify-between gap-3 px-4 py-3 bg-white border border-gray-200 rounded-xl text-left shadow-sm active:scale-[0.99] focus:outline-none focus-visible:ring-2 focus-visible:ring-green-400 transition-all" data-id="${escapeHtml(activity.id)}">
             <span class="min-w-0">
               <span class="block font-semibold text-gray-800 truncate">${escapeHtml(activity.name)}</span>
               <span class="block mt-0.5 text-[11px] text-gray-400 truncate">活動代碼：${escapeHtml(activity.id)}</span>
