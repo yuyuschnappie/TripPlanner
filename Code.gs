@@ -1,466 +1,472 @@
 /**
- * 一起出遊 — Google Apps Script 後端
+ * 旅遊版 Apps Script 後端
  *
- * 部署步驟：
- *   1. 開啟 https://script.google.com，新增專案
- *   2. 將此檔案內容貼入 Code.gs
- *   3. 點選「部署」→「新增部署作業」→ 類型選「網頁應用程式」
- *   4. 執行身分：我（你的 Google 帳號）
- *   5. 存取權：所有人
- *   6. 部署後複製產生的 URL，填入 app-config.js 對應環境的 apiUrl
- *      （一般使用者不需要設定 API）
+ * Java 對照：
+ * doGet/doPost              = Application entry point
+ * TravelController          = @RestController
+ * TravelService             = @Service
+ * SettlementService         = domain service
+ * TravelRepository          = @Repository
  */
 
-// ============================================================
-// SPREADSHEET HELPER（自動建立，不需手動設定）
-//
-// 資料採用固定的 activities / items 兩張表。請勿為每個活動建立一張
-// Sheet：新分頁的預設空白格會很快吃掉試算表容量，也會拖慢開啟速度。
-// ============================================================
-
-function getSpreadsheet() {
-  const props = PropertiesService.getScriptProperties();
-  let ssId = props.getProperty('SPREADSHEET_ID');
-
-  if (!ssId) {
-    const ss = SpreadsheetApp.create('一起出遊 — 資料庫');
-    ssId = ss.getId();
-    props.setProperty('SPREADSHEET_ID', ssId);
-
-    const sheet = ss.getSheets()[0];
-    sheet.setName('activities');
-  }
-
-  const ss = SpreadsheetApp.openById(ssId);
-  ensureSchema(ss);
-  return ss;
-}
-
-function styleHeader(sheet, columns) {
-  sheet.setFrozenRows(1);
-  sheet.getRange(1, 1, 1, columns)
-    .setBackground('#16a34a')
-    .setFontColor('white')
-    .setFontWeight('bold');
-}
-
-function ensureHeader(sheet, headers) {
-  const current = sheet.getRange(1, 1, 1, headers.length).getDisplayValues()[0];
-  const matches = headers.every((header, index) => current[index] === header);
-  if (!matches) {
-    sheet.getRange(1, 1, 1, headers.length).setValues([headers]);
-    styleHeader(sheet, headers.length);
-  }
-}
-
-function ensureSchema(ss) {
-  const activities = ss.getSheetByName('activities');
-  if (!activities) throw new Error('資料庫缺少 activities 工作表');
-
-  // 舊版只建立四個標題，實際上第五欄已在儲存 schedule；第六欄用來標示
-  // 已遷移至集中式 items 資料表的活動。
-  ensureHeader(activities, ['activityId', 'name', 'members', 'createdAt', 'schedule', 'storageVersion']);
-
-  let items = ss.getSheetByName('items');
-  if (!items) {
-    items = ss.insertSheet('items');
-    items.appendRow(['activityId', 'itemId', 'name', 'claimers', 'payer', 'amount', 'sharers', 'updatedAt', 'amountSet']);
-    items.setColumnWidth(1, 100);
-    items.setColumnWidth(2, 90);
-    items.setColumnWidth(3, 180);
-    items.setColumnWidth(4, 200);
-    items.setColumnWidth(5, 100);
-    items.setColumnWidth(6, 80);
-    items.setColumnWidth(7, 150);
-    items.setColumnWidth(8, 180);
-    items.setColumnWidth(9, 90);
-    styleHeader(items, 9);
-  } else {
-    ensureHeader(items, ['activityId', 'itemId', 'name', 'claimers', 'payer', 'amount', 'sharers', 'updatedAt', 'amountSet']);
-  }
-}
-
-function getActivitiesSheet(ss) {
-  return ss.getSheetByName('activities');
-}
-
-function getItemsSheet(ss) {
-  return ss.getSheetByName('items');
-}
-
-function findActivityRow(activitiesSheet, activityId) {
-  const rows = activitiesSheet.getDataRange().getValues();
-  for (let i = 1; i < rows.length; i++) {
-    if (String(rows[i][0]) === String(activityId)) return { row: i + 1, values: rows[i] };
-  }
-  return null;
-}
-
-function readItems(ss, activityId) {
-  const itemSheet = getItemsSheet(ss);
-  const rows = itemSheet.getDataRange().getValues();
-  const items = [];
-  for (let i = 1; i < rows.length; i++) {
-    if (String(rows[i][0]) !== String(activityId) || !rows[i][1]) continue;
-    // 舊資料沒有 amountSet；非零金額視為已填，舊的 0 則維持「未填」。
-    const amountSet = rows[i][8] === true || String(rows[i][8]).toLowerCase() === 'true' ||
-      (rows[i][8] === '' && rows[i][5] !== '' && Number(rows[i][5]) !== 0);
-    items.push({
-      id: String(rows[i][1]), name: String(rows[i][2]),
-      claimers: safeJSON(rows[i][3], []),
-      payer: String(rows[i][4] || ''), amount: amountSet ? Math.ceil(Number(rows[i][5]) || 0) : null,
-      sharers: safeJSON(rows[i][6], null)
-    });
-  }
-  return items;
-}
-
-// 保留既有活動資料：第一次讀取舊活動時，將舊活動分頁的資料複製進 items。
-// 不刪除舊分頁，避免遷移時造成使用者資料遺失；確認無誤後可由擁有者手動清理。
-function migrateLegacyActivityIfNeeded(ss, activityInfo, lockAlreadyHeld) {
-  if (activityInfo.values[5] === 'central-v1') return;
-
-  const lock = lockAlreadyHeld ? null : LockService.getScriptLock();
-  if (lock && !lock.tryLock(15000)) throw new Error('伺服器忙碌中，請稍後再試');
-  try {
-    // 等待鎖期間，另一個請求可能已完成遷移；重新讀取狀態後才決定是否複製。
-    const latest = findActivityRow(getActivitiesSheet(ss), activityInfo.values[0]);
-    if (!latest || latest.values[5] === 'central-v1') return;
-
-    const legacySheet = ss.getSheetByName(String(latest.values[0]));
-    const itemSheet = getItemsSheet(ss);
-    if (legacySheet) {
-      const rows = legacySheet.getDataRange().getValues();
-      const migratedRows = [];
-      for (let i = 1; i < rows.length; i++) {
-        if (!rows[i][0]) continue;
-        migratedRows.push([
-          String(latest.values[0]), String(rows[i][0]), String(rows[i][1]),
-          JSON.stringify(safeJSON(rows[i][2], [])), String(rows[i][3] || ''),
-          Number(rows[i][4]) || 0, JSON.stringify(safeJSON(rows[i][5], null)),
-          new Date().toISOString(), Number(rows[i][4]) !== 0
-        ]);
-      }
-      if (migratedRows.length) {
-        itemSheet.getRange(itemSheet.getLastRow() + 1, 1, migratedRows.length, 9).setValues(migratedRows);
-      }
-    }
-    getActivitiesSheet(ss).getRange(latest.row, 6).setValue('central-v1');
-  } finally {
-    if (lock) lock.releaseLock();
-  }
-}
-
-function generateId(length) {
-  // 全大寫讓使用者可以在手機上更容易輸入與辨識活動代碼。
-  const chars = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789';
-  let id = '';
-  for (let i = 0; i < (length || 8); i++) {
-    id += chars.charAt(Math.floor(Math.random() * chars.length));
-  }
-  return id;
-}
-
-function safeJSON(str, fallback) {
-  try { return JSON.parse(str || JSON.stringify(fallback)); } catch (e) { return fallback; }
-}
-
-function respond(data) {
-  return ContentService
-    .createTextOutput(JSON.stringify(data))
-    .setMimeType(ContentService.MimeType.JSON);
-}
-
-// ============================================================
-// HTTP HANDLERS
-// ============================================================
+const SHEETS = Object.freeze({
+  trips: ['code', 'name', 'members', 'currencies', 'createdAt', 'dates', 'rouletteEnabled'],
+  wishlist: ['tripCode', 'id', 'title', 'linkUrl', 'linkLabel', 'imageUrl', 'createdBy', 'position', 'updatedAt', 'details', 'links'],
+  itinerary: ['tripCode', 'id', 'date', 'time', 'title', 'location', 'linkUrl', 'updatedAt'],
+  expenses: ['tripCode', 'id', 'title', 'payer', 'settlementCurrency', 'amounts', 'sharers', 'createdBy', 'position', 'updatedAt', 'date']
+});
 
 function doGet(e) {
-  try {
-    const action = e.parameter.action;
-
-    // Read-only endpoints
-    if (action === 'ping') return respond({ status: 'ok', time: new Date().toISOString() });
-    if (action === 'getActivity') return handleGetActivity(e.parameter.id);
-
-    // Write operations: support both 'payload' (new) and 'data' base64 (legacy)
-    const rawPayload = e.parameter.payload || '';
-    const rawData    = e.parameter.data    || '';
-    if (rawPayload || rawData) {
-      let body;
-      if (rawPayload) {
-        body = JSON.parse(rawPayload);
-      } else {
-        // Legacy base64 decode (use for-loop; .map() unreliable on Apps Script byte[])
-        const rawBytes = Utilities.base64Decode(rawData);
-        let pctEncoded = '';
-        for (let i = 0; i < rawBytes.length; i++) {
-          const b = rawBytes[i];
-          pctEncoded += String.fromCharCode(b < 0 ? b + 256 : b);
-        }
-        body = JSON.parse(decodeURIComponent(pctEncoded));
-      }
-      // body is now parsed
-      const lock = LockService.getScriptLock();
-      if (!lock.tryLock(15000)) return respond({ error: '伺服器忙碌中，請稍後再試' });
-      try {
-        switch (body.action) {
-          case 'createActivity': return handleCreate(body);
-          case 'updateItem':     return handleUpdateItem(body);
-          case 'addItem':        return handleAddItem(body);
-          case 'deleteItem':     return handleDeleteItem(body);
-          case 'updateSchedule': return handleUpdateSchedule(body);
-          case 'reorderItems':   return handleReorderItems(body);
-          default: return respond({ error: 'Unknown action: ' + body.action });
-        }
-      } finally { lock.releaseLock(); }
-    }
-
-    return respond({ error: 'Unknown GET action: ' + action });
-  } catch (err) {
-    return respond({ error: err.toString() });
-  }
+  return TravelController.handle(Object.assign({}, e && e.parameter, {method: 'GET'}));
 }
 
 function doPost(e) {
-  try {
-    const body = JSON.parse(e.postData.contents);
-    const lock = LockService.getScriptLock();
-    if (!lock.tryLock(15000)) return respond({ error: '伺服器忙碌中，請稍後再試' });
+  let body = {};
+  try { body = JSON.parse((e && e.postData && e.postData.contents) || '{}'); }
+  catch (error) { return ApiResponse.error('JSON 格式錯誤'); }
+  return TravelController.handle(Object.assign({}, body, {method: 'POST'}));
+}
+
+class TravelController {
+  static handle(request) {
     try {
-      switch (body.action) {
-        case 'createActivity': return handleCreate(body);
-        case 'updateItem':     return handleUpdateItem(body);
-        case 'addItem':        return handleAddItem(body);
-        case 'deleteItem':     return handleDeleteItem(body);
-        case 'updateSchedule': return handleUpdateSchedule(body);
-        case 'reorderItems':   return handleReorderItems(body);
-        default: return respond({ error: 'Unknown action: ' + body.action });
+      const service = new TravelService(new TravelRepository());
+      const action = String(request.action || 'ping');
+      const routes = {
+        ping: () => ({status: 'ok', application: 'travel-planner'}),
+        createTrip: () => service.createTrip(request),
+        getTrip: () => service.getTrip(request.code || request.id, request.refresh),
+        saveWishlist: () => service.saveWishlist(request),
+        deleteWishlist: () => service.deleteWishlist(request),
+        reorderWishlist: () => service.reorder('wishlist', request),
+        saveItinerary: () => service.saveItinerary(request),
+        deleteItinerary: () => service.deleteItinerary(request),
+        saveTripDates: () => service.saveTripDates(request),
+        deleteTripDate: () => service.deleteTripDate(request),
+        saveExpense: () => service.saveExpense(request),
+        deleteExpense: () => service.deleteExpense(request),
+        reorderExpenses: () => service.reorder('expenses', request),
+        settlement: () => service.settlement(request.code),
+        uploadImage: () => service.uploadImage(request)
+      };
+      if (!routes[action]) throw new Error('不支援的操作：' + action);
+      const requiresLock = ['createTrip', 'deleteWishlist', 'reorderWishlist', 'deleteItinerary', 'deleteTripDate', 'deleteExpense', 'reorderExpenses'].includes(action);
+      return ApiResponse.ok(requiresLock ? this.withShortLock(routes[action]) : routes[action]());
+    } catch (error) {
+      console.error(error && error.stack ? error.stack : error);
+      return ApiResponse.error(error.message || '系統發生錯誤');
+    }
+  }
+
+  static withShortLock(task) {
+    const lock = LockService.getScriptLock();
+    if (!lock.tryLock(3000)) throw new Error('目前有其他資料正在更新，請稍後再試');
+    try { return task(); }
+    finally { lock.releaseLock(); }
+  }
+}
+
+class TravelService {
+  constructor(repository) { this.repository = repository; }
+
+  createTrip(request) {
+    const name = Text.required(request.name, '請輸入旅遊名稱', 100);
+    const members = Model.stringList(request.members, '至少需要一位成員');
+    const currencies = Model.currencies(request.currencies);
+    let code = String(request.customCode || '').trim().toUpperCase();
+    if (code && !/^[A-Z0-9]{3,24}$/.test(code)) throw new Error('活動代碼須為 3～24 位英數字');
+    if (!code) code = this.newCode();
+    if (this.repository.findTrip(code)) throw new Error('活動代碼已被使用');
+    const rouletteEnabled = request.rouletteEnabled === true || String(request.rouletteEnabled).toLowerCase() === 'true';
+    this.repository.append('trips', [code, name, JSON.stringify(members), JSON.stringify(currencies), new Date().toISOString(), JSON.stringify([]), rouletteEnabled]);
+    const trip = {code, name, members, currencies, dates: [], rouletteEnabled, wishlist: [], itinerary: [], expenses: []};
+    this.cacheTrip(trip);
+    return trip;
+  }
+
+  getTrip(code, refresh) {
+    code = String(code || '').trim().toUpperCase();
+    const forceRefresh = refresh === true || String(refresh).toLowerCase() === 'true' || String(refresh) === '1';
+    const cached = forceRefresh ? null : this.cachedTrip(code);
+    if (cached) return cached;
+    const trip = forceRefresh ? this.repository.findTrip(code) : this.requireTrip(code);
+    if (!trip) throw new Error('找不到此旅遊活動');
+    const result = Object.assign({}, trip, {
+      wishlist: this.repository.findAll('wishlist', trip.code).sort(Sort.byPosition),
+      itinerary: this.repository.findAll('itinerary', trip.code).sort(Sort.byDateTime),
+      expenses: this.repository.findAll('expenses', trip.code).sort(Sort.byPosition)
+    });
+    this.cacheTrip(result);
+    return result;
+  }
+
+  saveWishlist(request) {
+    const trip = this.requireTrip(request.code);
+    const requestedId = String(request.id || '').trim();
+    const id = requestedId || Utilities.getUuid();
+    const createdBy = this.requireMember(trip, request.createdBy);
+    const existing = this.repository.findById('wishlist', trip.code, id);
+    if (request.mode === 'update' && !existing) throw new Error('找不到要編輯的慾望卡片，請重新整理後再試');
+    const links = Model.links(request.links);
+    const firstLink = links[0] || {url: Text.url(request.linkUrl), label: Text.optional(request.linkLabel, 60)};
+    const item = {
+      tripCode: trip.code, id,
+      title: Text.required(request.title, '請輸入標題', 160),
+      linkUrl: firstLink.url || '',
+      linkLabel: firstLink.label || '',
+      imageUrl: request.imageDataUrl ? this.uploadImage({dataUrl: request.imageDataUrl}).url : Text.optional(request.imageUrl, 500),
+      createdBy: existing ? existing.createdBy : createdBy,
+      position: existing ? existing.position : this.repository.findAll('wishlist', trip.code).length,
+      updatedAt: new Date().toISOString(),
+      details: Text.optional(request.details, 2000),
+      links
+    };
+    this.repository.upsert('wishlist', item);
+    this.updateCachedCollection(trip.code, 'wishlist', item);
+    return item;
+  }
+
+  deleteWishlist(request) { const trip = this.requireTrip(request.code); this.repository.remove('wishlist', trip.code, request.id); this.removeCachedItem(trip.code, 'wishlist', request.id); return {success: true}; }
+
+  saveItinerary(request) {
+    const trip = this.requireTrip(request.code);
+    if (!/^\d{4}-\d{2}-\d{2}$/.test(String(request.date || ''))) throw new Error('請選擇日期');
+    const id = String(request.id || Utilities.getUuid());
+    const existing = this.repository.findById('itinerary', trip.code, id);
+    if (request.mode === 'update' && !existing) throw new Error('找不到要編輯的行程，請重新整理後再試');
+    const item = {
+      tripCode: trip.code, id, date: request.date,
+      time: String(request.time || ''), title: Text.required(request.title, '請輸入行程內容', 160),
+      location: Text.optional(request.location, 160), linkUrl: Text.url(request.linkUrl),
+      updatedAt: new Date().toISOString()
+    };
+    this.repository.upsert('itinerary', item);
+    if (!trip.dates.includes(item.date)) {
+      trip.dates = [...trip.dates, item.date].sort();
+      this.repository.setTripDates(trip.code, trip.dates);
+      this.updateCachedDates(trip.code, trip.dates);
+    }
+    this.updateCachedCollection(trip.code, 'itinerary', item);
+    return item;
+  }
+
+  deleteItinerary(request) { const trip = this.requireTrip(request.code); this.repository.remove('itinerary', trip.code, request.id); this.removeCachedItem(trip.code, 'itinerary', request.id); return {success: true}; }
+
+  saveTripDates(request) {
+    const trip = this.requireTrip(request.code);
+    const dates = Model.dates(request.dates);
+    this.repository.setTripDates(trip.code, dates);
+    this.updateCachedDates(trip.code, dates);
+    return dates;
+  }
+
+  deleteTripDate(request) {
+    const trip = this.requireTrip(request.code);
+    const date = String(request.date || '');
+    if (!/^\d{4}-\d{2}-\d{2}$/.test(date)) throw new Error('日期格式錯誤');
+    this.repository.removeItineraryByDate(trip.code, date);
+    const dates = (trip.dates || []).filter(item => item !== date);
+    this.repository.setTripDates(trip.code, dates);
+    this.updateCachedDates(trip.code, dates);
+    return {date, dates};
+  }
+
+  saveExpense(request) {
+    const trip = this.requireTrip(request.code);
+    const id = String(request.id || Utilities.getUuid());
+    const existing = this.repository.findById('expenses', trip.code, id);
+    if (request.mode === 'update' && !existing) throw new Error('找不到要編輯的記帳，請重新整理後再試');
+    const payer = this.requireMember(trip, request.payer);
+    const createdBy = this.requireMember(trip, request.createdBy);
+    const sharers = Model.stringList(request.sharers, '至少選擇一位分攤人');
+    sharers.forEach(member => this.requireMember(trip, member));
+    const amounts = Model.amounts(request.amounts, trip.currencies);
+    const settlementCurrency = amounts.length === 1 ? amounts[0].currencyCode : String(request.settlementCurrency || '').toUpperCase();
+    if (!amounts.some(amount => amount.currencyCode === settlementCurrency)) throw new Error('必須填寫所選結算幣別的金額');
+    const item = {
+      tripCode: trip.code, id, title: Text.required(request.title, '請輸入記帳名稱', 160), payer,
+      settlementCurrency, amounts, sharers, createdBy: existing ? existing.createdBy : createdBy,
+      position: existing ? existing.position : this.repository.findAll('expenses', trip.code).length,
+      updatedAt: new Date().toISOString(),
+      date: /^\d{4}-\d{2}-\d{2}$/.test(String(request.date || '')) ? request.date : Utilities.formatDate(new Date(), 'Asia/Taipei', 'yyyy-MM-dd')
+    };
+    this.repository.upsert('expenses', item);
+    this.updateCachedCollection(trip.code, 'expenses', item);
+    return item;
+  }
+
+  deleteExpense(request) { const trip = this.requireTrip(request.code); this.repository.remove('expenses', trip.code, request.id); this.removeCachedItem(trip.code, 'expenses', request.id); return {success: true}; }
+
+  reorder(sheetName, request) {
+    const trip = this.requireTrip(request.code);
+    const ids = Model.stringList(request.ids, '排序資料不可為空');
+    const current = this.repository.findAll(sheetName, trip.code);
+    if (ids.length !== current.length || current.some(item => !ids.includes(String(item.id)))) throw new Error('排序資料與清單不一致');
+    ids.forEach((id, position) => this.repository.updateField(sheetName, trip.code, id, 'position', position));
+    this.reorderCachedCollection(trip.code, sheetName, ids);
+    return {success: true};
+  }
+
+  settlement(code) {
+    const trip = this.requireTrip(code);
+    return SettlementService.calculate(trip, this.repository.findAll('expenses', trip.code));
+  }
+
+  uploadImage(request) {
+    const dataUrl = String(request.dataUrl || '');
+    const match = dataUrl.match(/^data:(image\/(?:jpeg|png|webp|gif));base64,(.+)$/);
+    if (!match) throw new Error('圖片格式不支援');
+    const bytes = Utilities.base64Decode(match[2]);
+    if (bytes.length > 8 * 1024 * 1024) throw new Error('圖片不可超過 8MB');
+    const extension = { 'image/jpeg': 'jpg', 'image/png': 'png', 'image/webp': 'webp', 'image/gif': 'gif' }[match[1]];
+    const folder = this.imageFolder();
+    const file = folder.createFile(Utilities.newBlob(bytes, match[1], Utilities.getUuid() + '.' + extension));
+    file.setSharing(DriveApp.Access.ANYONE_WITH_LINK, DriveApp.Permission.VIEW);
+    return {url: 'https://drive.google.com/thumbnail?id=' + file.getId() + '&sz=w1600'};
+  }
+
+  imageFolder() {
+    const properties = PropertiesService.getScriptProperties();
+    const storedId = properties.getProperty('IMAGE_FOLDER_ID');
+    if (storedId) { try { return DriveApp.getFolderById(storedId); } catch (ignored) {} }
+    const folder = DriveApp.createFolder('一起出遊－旅遊圖片');
+    properties.setProperty('IMAGE_FOLDER_ID', folder.getId());
+    return folder;
+  }
+
+  requireTrip(code) {
+    code = String(code || '').trim().toUpperCase();
+    const trip = this.cachedTrip(code) || this.cachedTripMeta(code) || this.repository.findTrip(code);
+    if (!trip) throw new Error('找不到此旅遊活動');
+    this.cacheTripMeta(trip);
+    return trip;
+  }
+  requireMember(trip, member) {
+    member = String(member || '').trim();
+    if (!trip.members.includes(member)) throw new Error('請先選擇旅遊成員');
+    return member;
+  }
+  cachedTrip(code) {
+    if (!code) return null;
+    try {
+      const value = CacheService.getScriptCache().get('trip:' + code);
+      if (!value) return null;
+      const trip = JSON.parse(value); trip.dates = Array.isArray(trip.dates) ? trip.dates : [];
+      return trip;
+    } catch (ignored) { return null; }
+  }
+  cachedTripMeta(code) {
+    try {
+      const value = CacheService.getScriptCache().get('trip-meta:' + code);
+      return value ? JSON.parse(value) : null;
+    } catch (ignored) { return null; }
+  }
+  cacheTripMeta(trip) {
+    try {
+      const metadata = {code: trip.code, name: trip.name, members: trip.members, currencies: trip.currencies, dates: Array.isArray(trip.dates) ? trip.dates : [], rouletteEnabled: Boolean(trip.rouletteEnabled)};
+      CacheService.getScriptCache().put('trip-meta:' + trip.code, JSON.stringify(metadata), 1800);
+    } catch (ignored) {}
+  }
+  cacheTrip(trip) {
+    try {
+      CacheService.getScriptCache().put('trip:' + trip.code, JSON.stringify(trip), 1800);
+      this.cacheTripMeta(trip);
+    }
+    catch (ignored) {}
+  }
+  invalidateTrip(code) {
+    try { CacheService.getScriptCache().remove('trip:' + code); }
+    catch (ignored) {}
+  }
+  updateCachedCollection(code, collection, item) {
+    this.invalidateTrip(code);
+  }
+  removeCachedItem(code, collection, id) {
+    this.invalidateTrip(code);
+  }
+  reorderCachedCollection(code, collection, ids) {
+    this.invalidateTrip(code);
+  }
+  updateCachedDates(code, dates) {
+    try {
+      const trip = this.cachedTripMeta(code);
+      if (trip) { trip.dates = dates; CacheService.getScriptCache().put('trip-meta:' + code, JSON.stringify(trip), 1800); }
+    } catch (ignored) {}
+    this.invalidateTrip(code);
+  }
+  newCode() {
+    const chars = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789';
+    let code;
+    do { code = Array.from({length: 8}, () => chars[Math.floor(Math.random() * chars.length)]).join(''); }
+    while (this.repository.findTrip(code));
+    return code;
+  }
+}
+
+class SettlementService {
+  static calculate(trip, expenses) {
+    return trip.currencies.map(currency => {
+      const selected = expenses.filter(expense => expense.settlementCurrency === currency.code);
+      if (!selected.length) return null;
+      const paid = Object.fromEntries(trip.members.map(member => [member, 0]));
+      const balance = Object.fromEntries(trip.members.map(member => [member, 0]));
+      let total = 0;
+      selected.forEach(expense => {
+        const money = expense.amounts.find(amount => amount.currencyCode === currency.code);
+        if (!money) throw new Error(expense.title + ' 缺少結算幣別金額');
+        const factor = Math.pow(10, currency.decimalPlaces);
+        const amount = Math.ceil(Number(money.amount) * factor);
+        paid[expense.payer] += amount; balance[expense.payer] += amount; total += amount;
+        const base = Math.floor(amount / expense.sharers.length), remainder = amount % expense.sharers.length;
+        expense.sharers.forEach((member, index) => balance[member] -= base + (index < remainder ? 1 : 0));
+      });
+      const creditors = trip.members.filter(m => balance[m] > 0).map(m => ({name:m, amount:balance[m]})).sort((a,b) => b.amount-a.amount);
+      const debtors = trip.members.filter(m => balance[m] < 0).map(m => ({name:m, amount:-balance[m]})).sort((a,b) => b.amount-a.amount);
+      const transfers = []; let ci = 0, di = 0;
+      while (ci < creditors.length && di < debtors.length) {
+        const amount = Math.min(creditors[ci].amount, debtors[di].amount);
+        transfers.push({from: debtors[di].name, to: creditors[ci].name, amount: amount / Math.pow(10, currency.decimalPlaces)});
+        creditors[ci].amount -= amount; debtors[di].amount -= amount;
+        if (!creditors[ci].amount) ci++; if (!debtors[di].amount) di++;
       }
-    } finally {
-      lock.releaseLock();
+      return {currency, total: total / Math.pow(10, currency.decimalPlaces), transfers,
+        personalCost: Object.fromEntries(trip.members.map(member => [member, (paid[member] - balance[member]) / Math.pow(10, currency.decimalPlaces)]))};
+    }).filter(Boolean);
+  }
+}
+
+class TravelRepository {
+  constructor() { this.spreadsheet = null; this.rowCache = {}; }
+  database() {
+    if (this.spreadsheet) return this.spreadsheet;
+    const properties = PropertiesService.getScriptProperties();
+    const id = properties.getProperty('SPREADSHEET_ID');
+    if (id) { this.spreadsheet = SpreadsheetApp.openById(id); return this.spreadsheet; }
+    const spreadsheet = SpreadsheetApp.create('一起出遊－旅遊資料庫');
+    spreadsheet.setSpreadsheetTimeZone('Asia/Taipei');
+    properties.setProperty('SPREADSHEET_ID', spreadsheet.getId());
+    this.spreadsheet = spreadsheet;
+    return this.spreadsheet;
+  }
+  sheet(name) {
+    const spreadsheet = this.database();
+    let sheet = spreadsheet.getSheetByName(name);
+    if (!sheet) { sheet = spreadsheet.insertSheet(name); sheet.appendRow(SHEETS[name]); sheet.setFrozenRows(1); }
+    else if (sheet.getLastColumn() < SHEETS[name].length) sheet.getRange(1, 1, 1, SHEETS[name].length).setValues([SHEETS[name]]);
+    return sheet;
+  }
+  rows(name) {
+    if (this.rowCache[name]) return this.rowCache[name];
+    const values = this.sheet(name).getDataRange().getValues();
+    this.rowCache[name] = values.slice(1).filter(row => row.some(value => value !== '')).map((row, index) => {
+      const object = {_row: index + 2};
+      SHEETS[name].forEach((header, column) => object[header] = this.parse(header, row[column]));
+      return object;
+    });
+    return this.rowCache[name];
+  }
+  parse(field, value) {
+    if (['members','currencies','amounts','sharers','dates','links'].includes(field)) { try { return JSON.parse(value || '[]'); } catch (ignored) { return []; } }
+    if (field === 'rouletteEnabled') return value === true || String(value).toLowerCase() === 'true';
+    if (field === 'position') return Number(value || 0);
+    if (value instanceof Date) {
+      const timezone = this.database().getSpreadsheetTimeZone() || 'Asia/Taipei';
+      if (field === 'date') return Utilities.formatDate(value, timezone, 'yyyy-MM-dd');
+      if (field === 'time') return Utilities.formatDate(value, timezone, 'HH:mm');
+      return value.toISOString();
     }
-  } catch (err) {
-    return respond({ error: err.toString() });
+    return value;
   }
-}
-
-// ============================================================
-// ACTION HANDLERS
-// ============================================================
-
-function handleCreate(body) {
-  const { name, members, items, customId } = body;
-  if (!name || !Array.isArray(members) || !Array.isArray(items))
-    return respond({ error: '缺少必要欄位（name / members / items）' });
-  if (members.length === 0) return respond({ error: '至少需要一位成員' });
-
-  const normalMembers = members.map(m => String(m).trim()).filter(Boolean);
-  const normalItems = items.map(i => String(i).trim()).filter(Boolean);
-  if (normalMembers.length === 0) return respond({ error: '至少需要一位有效成員' });
-  if (new Set(normalMembers).size !== normalMembers.length) return respond({ error: '成員名稱不可重複' });
-  if (new Set(normalItems).size !== normalItems.length) return respond({ error: '品項名稱不可重複' });
-  if (normalMembers.some(m => m.length > 50) || normalItems.some(i => i.length > 100) || String(name).trim().length > 100) {
-    return respond({ error: '活動名稱最多 100 字；成員名稱最多 50 字；品項名稱最多 100 字' });
+  serialize(name, object) { return SHEETS[name].map(field => ['members','currencies','amounts','sharers','dates','links'].includes(field) ? JSON.stringify(object[field] || []) : object[field]); }
+  append(name, row) {
+    const sheet = this.sheet(name), rowNumber = sheet.getLastRow() + 1;
+    if (name === 'itinerary') sheet.getRange(rowNumber, 3, 1, 2).setNumberFormat('@');
+    sheet.getRange(rowNumber, 1, 1, row.length).setValues([row]);
+    delete this.rowCache[name];
   }
-
-  const ss = getSpreadsheet();
-  const activitiesSheet = getActivitiesSheet(ss);
-  let actId = String(customId || '').trim().toUpperCase();
-  if (actId && !/^[A-Z0-9]{3,24}$/.test(actId)) {
-    return respond({ error: '自訂活動代碼須為 3～24 位英文字母或數字' });
+  findTrip(code) {
+    const row = this.rows('trips').find(item => String(item.code).toUpperCase() === code);
+    return row ? {code: row.code, name: row.name, members: row.members, currencies: row.currencies, dates: row.dates || [], rouletteEnabled: Boolean(row.rouletteEnabled)} : null;
   }
-  if (actId && findActivityRow(activitiesSheet, actId)) {
-    return respond({ error: '此活動代碼已被使用，請換一個' });
+  setTripDates(code, dates) {
+    const existing = this.rows('trips').find(item => String(item.code).toUpperCase() === code); if (!existing) throw new Error('找不到此旅遊活動');
+    this.sheet('trips').getRange(existing._row, SHEETS.trips.indexOf('dates') + 1).setValue(JSON.stringify(dates));
+    delete this.rowCache.trips;
   }
-  if (!actId) {
-    actId = generateId(8);
-    while (findActivityRow(activitiesSheet, actId)) actId = generateId(8);
-  }
-  const now = new Date().toISOString();
-
-  activitiesSheet.appendRow([actId, String(name).trim(), JSON.stringify(normalMembers), now, '[]', 'central-v1']);
-
-  const itemRows = normalItems.map(itemName => [
-    actId, generateId(6), itemName, '[]', '', '', 'null', now, false
-  ]);
-  if (itemRows.length) {
-    const itemsSheet = getItemsSheet(ss);
-    itemsSheet.getRange(itemsSheet.getLastRow() + 1, 1, itemRows.length, 9).setValues(itemRows);
-  }
-
-  return respond({ success: true, activityId: actId });
-}
-
-function handleGetActivity(id) {
-  if (!id) return respond({ error: '缺少活動 ID' });
-
-  const ss = getSpreadsheet();
-  const activitiesSheet = getActivitiesSheet(ss);
-  // 自訂代碼一律儲存為大寫；保留舊版亂數代碼的精確比對相容性。
-  const activityInfo = findActivityRow(activitiesSheet, id) || findActivityRow(activitiesSheet, String(id).trim().toUpperCase());
-  if (!activityInfo) return respond({ error: '找不到此活動，請確認活動代碼是否正確' });
-
-  migrateLegacyActivityIfNeeded(ss, activityInfo);
-  const values = activityInfo.values;
-  const activity = {
-    id: values[0], name: values[1],
-    members: safeJSON(values[2], []), createdAt: values[3],
-    schedule: safeJSON(values[4], []), items: readItems(ss, values[0])
-  };
-
-  return respond({ success: true, activity });
-}
-
-function handleUpdateItem(body) {
-  const { activityId, itemId, name, claimers, payer, amount, sharers } = body;
-  if (!activityId || !itemId) return respond({ error: '缺少 activityId 或 itemId' });
-
-  const ss = getSpreadsheet();
-  const activityInfo = findActivityRow(getActivitiesSheet(ss), activityId);
-  if (!activityInfo) return respond({ error: '找不到此活動' });
-  migrateLegacyActivityIfNeeded(ss, activityInfo, true);
-  const members = safeJSON(activityInfo.values[2], []);
-  if (!Array.isArray(claimers) || (sharers !== null && sharers !== undefined && !Array.isArray(sharers))) {
-    return respond({ error: '認領人與分攤人格式錯誤' });
-  }
-  const validClaimers = claimers.every(m => members.includes(m));
-  const validPayer = !payer || members.includes(payer);
-  const validSharers = !sharers || (sharers.length > 0 && sharers.every(m => members.includes(m)));
-  if (!validClaimers || !validPayer || !validSharers) return respond({ error: '認領人、代墊人與分攤人必須是活動成員' });
-  const amountSet = amount !== null && amount !== undefined && amount !== '';
-  if (amountSet && (!Number.isFinite(Number(amount)) || Number(amount) < 0)) return respond({ error: '金額必須是非負數字' });
-  if (name !== undefined && !String(name).trim()) return respond({ error: '品項名稱不可空白' });
-  if (name !== undefined && String(name).trim().length > 100) return respond({ error: '品項名稱最多 100 字' });
-
-  const sheet = getItemsSheet(ss);
-  const rows = sheet.getDataRange().getValues();
-  for (let i = 1; i < rows.length; i++) {
-    if (String(rows[i][0]) === String(activityId) && String(rows[i][1]) === String(itemId)) {
-      sheet.getRange(i + 1, 3, 1, 7).setValues([[
-        String(name === undefined ? rows[i][2] : name).trim(), JSON.stringify(claimers), payer || '',
-        amountSet ? Math.ceil(Number(amount)) : '', JSON.stringify(sharers || null), new Date().toISOString(), amountSet
-      ]]);
-      return respond({ success: true });
+  findAll(name, tripCode) { return this.rows(name).filter(item => String(item.tripCode).toUpperCase() === tripCode); }
+  findById(name, tripCode, id) { return this.findAll(name, tripCode).find(item => String(item.id) === String(id)); }
+  upsert(name, object) {
+    const existing = this.findById(name, object.tripCode, object.id), values = this.serialize(name, object);
+    const sheet = this.sheet(name);
+    if (existing) {
+      if (name === 'itinerary') sheet.getRange(existing._row, 3, 1, 2).setNumberFormat('@');
+      sheet.getRange(existing._row, 1, 1, values.length).setValues([values]);
+    } else {
+      sheet.appendRow(values);
+      if (name === 'itinerary') sheet.getRange(sheet.getLastRow(), 3, 1, 2).setNumberFormat('@');
     }
+    delete this.rowCache[name];
   }
-
-  return respond({ error: '找不到此品項' });
+  updateField(name, tripCode, id, field, value) {
+    const existing = this.findById(name, tripCode, id); if (!existing) throw new Error('找不到資料');
+    this.sheet(name).getRange(existing._row, SHEETS[name].indexOf(field) + 1).setValue(value);
+    delete this.rowCache[name];
+  }
+  remove(name, tripCode, id) {
+    const existing = this.findById(name, tripCode, id); if (!existing) throw new Error('找不到資料');
+    this.sheet(name).deleteRow(existing._row);
+    delete this.rowCache[name];
+  }
+  removeItineraryByDate(tripCode, date) {
+    const rows = this.findAll('itinerary', tripCode).filter(item => String(item.date) === date).sort((a, b) => b._row - a._row);
+    const sheet = this.sheet('itinerary');
+    rows.forEach(item => sheet.deleteRow(item._row));
+    delete this.rowCache.itinerary;
+  }
 }
 
-function handleAddItem(body) {
-  const { activityId, name } = body;
-  if (!activityId || !name || !String(name).trim()) return respond({ error: '缺少 activityId 或 name' });
-  if (String(name).trim().length > 100) return respond({ error: '品項名稱最多 100 字' });
-
-  const ss = getSpreadsheet();
-  const activityInfo = findActivityRow(getActivitiesSheet(ss), activityId);
-  if (!activityInfo) return respond({ error: '找不到此活動' });
-  migrateLegacyActivityIfNeeded(ss, activityInfo, true);
-  if (readItems(ss, activityId).some(item => item.name === String(name).trim())) {
-    return respond({ error: '已有相同名稱的品項' });
+class Model {
+  static stringList(value, message) {
+    const list = Array.isArray(value) ? value.map(String).map(v => v.trim()).filter(Boolean) : [];
+    const unique = [...new Set(list)]; if (!unique.length) throw new Error(message); return unique;
   }
-  const itemId = generateId(6);
-  getItemsSheet(ss).appendRow([activityId, itemId, String(name).trim(), '[]', '', '', 'null', new Date().toISOString(), false]);
-
-  return respond({ success: true, itemId });
+  static currencies(value) {
+    if (!Array.isArray(value) || !value.length) throw new Error('至少設定一種幣別');
+    const result = value.map(item => ({code: String(item.code || '').trim().toUpperCase(), name: Text.required(item.name, '請輸入幣別名稱', 30), symbol: Text.required(item.symbol, '請輸入幣別符號', 8), decimalPlaces: Math.max(0, Math.min(2, Number(item.decimalPlaces || 0)))}));
+    if (result.some(item => !/^[A-Z]{3,8}$/.test(item.code)) || new Set(result.map(item => item.code)).size !== result.length) throw new Error('幣別代碼須為 3～8 位英文字且不可重複');
+    return result;
+  }
+  static amounts(value, currencies) {
+    const supported = currencies.map(currency => currency.code);
+    const result = (Array.isArray(value) ? value : []).filter(item => item.amount !== '' && item.amount != null).map(item => ({currencyCode: String(item.currencyCode || '').toUpperCase(), amount: Number(item.amount)}));
+    if (!result.length || result.some(item => !supported.includes(item.currencyCode) || !Number.isFinite(item.amount) || item.amount <= 0) || new Set(result.map(item => item.currencyCode)).size !== result.length) throw new Error('請正確填寫至少一筆幣別金額');
+    return result;
+  }
+  static dates(value) {
+    const dates = [...new Set((Array.isArray(value) ? value : []).map(String).filter(date => /^\d{4}-\d{2}-\d{2}$/.test(date)))].sort();
+    if (!dates.length) throw new Error('至少需要一個旅遊日期');
+    return dates;
+  }
+  static links(value) {
+    if (!Array.isArray(value)) return [];
+    if (value.length > 10) throw new Error('一張慾望卡最多可設定 10 個連結');
+    return value.map(item => ({url: Text.url(item && item.url), label: Text.optional(item && item.label, 60)})).filter(item => item.url);
+  }
 }
 
-function handleDeleteItem(body) {
-  const { activityId, itemId } = body;
-  if (!activityId || !itemId) return respond({ error: '缺少 activityId 或 itemId' });
-
-  const ss = getSpreadsheet();
-  const activityInfo = findActivityRow(getActivitiesSheet(ss), activityId);
-  if (!activityInfo) return respond({ error: '找不到此活動' });
-  migrateLegacyActivityIfNeeded(ss, activityInfo, true);
-  const sheet = getItemsSheet(ss);
-  const rows = sheet.getDataRange().getValues();
-  for (let i = 1; i < rows.length; i++) {
-    if (String(rows[i][0]) === String(activityId) && String(rows[i][1]) === String(itemId)) {
-      sheet.deleteRow(i + 1);
-      return respond({ success: true });
-    }
-  }
-
-  return respond({ error: '找不到此品項' });
+class Text {
+  static required(value, message, max) { const text = String(value || '').trim(); if (!text) throw new Error(message); if (text.length > max) throw new Error('文字長度不可超過 ' + max + ' 字'); return text; }
+  static optional(value, max) { const text = String(value || '').trim(); if (text.length > max) throw new Error('文字長度不可超過 ' + max + ' 字'); return text; }
+  static url(value) { const text = String(value || '').trim(); if (text && !/^https?:\/\//i.test(text)) throw new Error('連結必須以 http:// 或 https:// 開頭'); return text; }
 }
 
-function handleUpdateSchedule(body) {
-  const { activityId, schedule } = body;
-  if (!activityId || !Array.isArray(schedule)) return respond({ error: '缺少 activityId 或 schedule' });
-  if (schedule.length > 100 || schedule.some(s => !s || typeof s.time !== 'string' || typeof s.title !== 'string' ||
-      (s.location !== undefined && typeof s.location !== 'string') ||
-      (s.locationUrl !== undefined && (typeof s.locationUrl !== 'string' || (s.locationUrl && !isValidExternalUrl(s.locationUrl)))) ||
-      (s.date !== undefined && (typeof s.date !== 'string' || (s.date && !isValidScheduleDate(s.date)))) ||
-      s.time.length > 30 || s.location?.length > 100 || s.title.length > 200 || s.locationUrl?.length > 500)) {
-    return respond({ error: '行程資料格式錯誤或超過上限' });
-  }
-
-  // date 是新版欄位；舊活動沒有 date 時保留空字串，讓前端提示補填。
-  const normalizedSchedule = schedule.map(s => ({
-    date: String(s.date || ''), time: s.time,
-    location: String(s.location || ''), title: s.title,
-    locationUrl: String(s.locationUrl || '')
-  }));
-
-  const ss = getSpreadsheet();
-  const activitiesSheet = ss.getSheetByName('activities');
-  if (!activitiesSheet) return respond({ error: '資料庫尚未初始化' });
-
-  const rows = activitiesSheet.getDataRange().getValues();
-  for (let i = 1; i < rows.length; i++) {
-    if (String(rows[i][0]) === String(activityId)) {
-      activitiesSheet.getRange(i + 1, 5).setValue(JSON.stringify(normalizedSchedule));
-      return respond({ success: true });
-    }
-  }
-  return respond({ error: '找不到此活動' });
+class Sort {
+  static byPosition(a, b) { return Number(a.position) - Number(b.position); }
+  static byDateTime(a, b) { return String(a.date).localeCompare(String(b.date)) || String(a.time || '99:99').localeCompare(String(b.time || '99:99')); }
 }
 
-function isValidScheduleDate(date) {
-  if (!/^\d{4}-\d{2}-\d{2}$/.test(date)) return false;
-  const parsed = new Date(date + 'T00:00:00Z');
-  return !isNaN(parsed.getTime()) && parsed.toISOString().slice(0, 10) === date;
-}
-
-function isValidExternalUrl(value) {
-  if (typeof value !== 'string') return false;
-  return value.startsWith('http://') || value.startsWith('https://');
-}
-
-function handleReorderItems(body) {
-  const { activityId, itemIds } = body;
-  if (!activityId || !Array.isArray(itemIds)) return respond({ error: '缺少 activityId 或 itemIds' });
-
-  const ss = getSpreadsheet();
-  const activityInfo = findActivityRow(getActivitiesSheet(ss), activityId);
-  if (!activityInfo) return respond({ error: '找不到此活動' });
-  migrateLegacyActivityIfNeeded(ss, activityInfo, true);
-
-  const sheet = getItemsSheet(ss);
-  const rows = sheet.getDataRange().getValues();
-  
-  const rowIndices = [];
-  const rowsData = [];
-  for (let i = 1; i < rows.length; i++) {
-    if (String(rows[i][0]) === String(activityId)) {
-      rowIndices.push(i);
-      rowsData.push(rows[i]);
-    }
-  }
-  
-  rowsData.sort((a, b) => {
-    let idxA = itemIds.indexOf(String(a[1]));
-    let idxB = itemIds.indexOf(String(b[1]));
-    if (idxA === -1) idxA = 9999;
-    if (idxB === -1) idxB = 9999;
-    return idxA - idxB;
-  });
-  
-  for (let k = 0; k < rowIndices.length; k++) {
-    const rowIndex = rowIndices[k] + 1;
-    sheet.getRange(rowIndex, 1, 1, rowsData[k].length).setValues([rowsData[k]]);
-  }
-  return respond({ success: true });
+class ApiResponse {
+  static ok(data) { return this.json({success: true, data}); }
+  static error(message) { return this.json({success: false, error: message}); }
+  static json(value) { return ContentService.createTextOutput(JSON.stringify(value)).setMimeType(ContentService.MimeType.JSON); }
 }

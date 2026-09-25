@@ -1,146 +1,64 @@
-# 一起出遊 🏕️ — 品項認領 & 金流結算
+# 一起旅行 ✈️
 
-> 無伺服器・無資料庫 · 用 Google Sheets 當後端，完全免費
+`feature/旅遊用途` 是以純旅遊規劃為目的的 Apps Script 版本，包含：
 
----
+- 慾望清單：標題、詳細內容、多組自訂連結、Google Drive 圖片、建立者、編輯／刪除與拖曳排序；清單顯示詳細內容前 50 字，卡片上的連結與照片可直接開啟。
+- 行程表：選擇開始與結束日期即可一次建立整段旅遊日期；各日期下新增、編輯或刪除行程，並依時間排序。日期本身也可經確認後刪除，該日行程會一併移除。
+- 記帳：一筆費用可同時記錄多個幣別等值金額，指定代墊人、分攤人與結算幣別，卡片可再編輯或刪除。
+- 金流結算：保留最少付款次數、個人總額、代墊與品項明細，並讓不同幣別各自計算。
+- 活動轉盤：建立旅程時可選擇啟用；啟用後會顯示浮動轉盤按鈕，每位成員的格數與中選機率完全相同。
+- 手機版：日期按鈕自動換行，表單具備完整欄位標題，彈窗支援動態視窗高度與安全區域，並修正 iOS 原生日期／時間輸入框超出彈窗的問題。
 
-## 快速開始（約 15 分鐘）
+## Apps Script 分層
 
-### Step 1：部署 Google Apps Script 後端
+雖然 Apps Script 使用 JavaScript，`Code.gs` 依照 Java 後端習慣分層：
 
-1. 開啟 [script.google.com](https://script.google.com)
-2. 點「新增專案」
-3. 刪除預設程式碼，將 Code.gs 的全部內容貼入
-4. 點選上方「部署」→「新增部署作業」
-5. 類型選「**網頁應用程式**」
-6. 設定：
-   - 執行身分：**我（你的 Google 帳號）**
-   - 存取權：**所有人**
-7. 點「部署」，完成 Google 授權
-8. **複製產生的 Web App URL**（格式：https://script.google.com/macros/s/xxx/exec）
+```text
+doGet / doPost
+      ↓
+TravelController       // 類似 @RestController
+      ↓
+TravelService          // 類似 @Service，負責案例流程與驗證
+SettlementService      // 領域計算服務
+      ↓
+TravelRepository       // 類似 @Repository，封裝 Google Sheets
+      ↓
+Google Sheets / Drive
+```
 
-> ⚠️ 第一次部署後，Google 會自動在你的雲端硬碟建立一個「一起出遊 — 資料庫」試算表
+資料分成 `trips`、`wishlist`、`itinerary`、`expenses` 四張工作表。圖片實體放在 Google Drive，Sheet 只保存網址。後端會自動在既有 Sheet 尾端補上 `rouletteEnabled`、`details`、`links` 等新欄位，不需手動改欄位順序。
 
----
+建立旅程時，成員採逐筆新增的標籤模式，可按 Enter 或「新增」加入，也可用標籤上的 × 移除。幣別提供常用資料建議；輸入 `KRW` 或「韓幣」會自動補齊 `KRW／韓幣／₩`，未收錄的幣別仍可自行填寫。
 
-### Step 2：維護者設定前端（只需一次）
+## 部署
 
-1. 開啟 `app-config.js`，設定各前端網域對應的 Apps Script Web App URL。
-2. 將 `index.html`、`app-config.js`、`manifest.webmanifest` 與完整的 `icons` 資料夾一起上傳到靜態網站。
-3. 一般使用者直接開啟網站或分享連結即可使用，**不需要** Google 帳號、Apps Script 或 API 設定。
+1. 建議建立一個全新的「旅遊版」Apps Script 專案，再貼上 [Code.gs](./Code.gs)，避免沿用舊版的 `SPREADSHEET_ID` 與資料庫。
+2. 部署為網頁應用程式，執行身分選擇自己，存取權設定為所有人。
+3. 將旅遊版部署網址設定到 [travel-app-config.js](./travel-app-config.js)，不要覆蓋原系統的 `master` 或 `dev` 設定。
+4. Cloudflare 靜態檔案需包含：
+   - `index.html`
+   - `travel-app.js`
+   - `travel-styles.css`
+   - `travel-app-config.js`
+   - `manifest.webmanifest`
+   - 完整 `icons/` 資料夾
 
-> 維護者若要測試或暫時改用另一組 API，可在網址後加上 `?setup=1` 開啟設定頁；這只影響自己的瀏覽器。
+第一次建立旅程時會自動建立 Google Sheet，並寫入指令碼屬性 `SPREADSHEET_ID`。第一次上傳圖片時會建立 Drive 資料夾，並寫入 `IMAGE_FOLDER_ID`。
 
-> 從活動連結加入手機主畫面時，PWA 會以當下包含活動代碼的網址作為啟動頁；更新 Manifest 後，既有的主畫面捷徑需移除並重新加入才會套用。
+## 多幣別規則
 
----
+一筆「魚板」可以同時記錄 `KRW 3000` 與 `TWD 70`，但必須指定一個結算幣別：
 
-## 使用流程
+- 選 TWD：只使用 TWD 70 進入台幣結算。
+- 選 KRW：只使用 KRW 3000 進入韓幣結算。
+- 只有一種金額時，結算幣別就選該幣別。
 
-### 主揪（建立活動）
-1. 點「✨ 建立新活動」
-2. 可選填 3～24 位英數活動代碼（會轉為大寫）；留空則自動產生
-3. 輸入活動名稱、新增所有成員名字；品項可先留白，之後再於活動內新增
-4. 點「🚀 建立活動」
-5. 複製分享連結（右上角 🔗 分享按鈕）傳給所有成員
+系統不會自行猜測即時匯率，避免匯率時間點與刷卡手續費造成帳務爭議。
 
-### 成員（認領品項）
-1. 打開主揪傳來的連結
-2. 在「我是」下拉選單選自己的名字
-3. 對要帶的品項點「✋ 我來帶」
-4. 若有人已付款，在付款人選下拉選自己，並輸入金額
-5. 點「💾 儲存付款人 / 金額」
+## 儲存體感與重複資料防護
 
-### 安排行程
-1. 在「📅 行程表」點「＋ 新增行程」
-2. 為日期區段新增行程，填入時間、地點、內容；可附上 Google Maps 等地點連結
-3. 行程會依日期分段、按時間排序；跨日活動可直接在同一個活動中管理
+Apps Script 第一次喚醒或 Google Drive 圖片上傳仍可能需要數秒，但慾望、行程、記帳與日期新增都會先更新畫面，再於背景同步。每筆新資料由前端先產生固定 ID，重試時會更新同一筆資料，不會因慢速回應另外新增空白卡片；同步失敗時則還原原本畫面並顯示錯誤。
 
-### 查看結算
-1. 點上方「💰 金流結算」分頁
-2. 查看總支出、每人均攤金額
-3. 「付款方式」區塊顯示最少次數的匯款清單
+旅程頁載入時會先顯示瀏覽器快取，再強制向 Sheet 重新讀取一次最新資料。因此管理者直接在 `trips` 工作表修改 `rouletteEnabled` 為 `TRUE`，背景更新完成後也會顯示轉盤按鈕，不會再被 Apps Script 的舊快取遮蔽。
 
----
-
-## 結算邏輯
-
-- 金額以新台幣整元儲存；輸入小數時會**無條件進位**
-- 所有費用由指定分攤人平均分攤；無法整除的整元餘額依分攤人順序分配，總額不會產生小數或誤差
-- 代墊金額 - 均攤金額 = 餘額
-  - 正值 → 收回（別人要付你錢）
-  - 負值 → 應付（你要付錢給別人）
-- 使用 Greedy 演算法，將付款次數最小化
-
-**範例：**
-| 成員 | 代墊 | 均攤 | 收/付 |
-|------|------|------|-------|
-| 小明 | ,200 |  | 收回  |
-| 小華 |  |  | 收回  |
-| 小陳 |  |  | 應付  |
-| 阿婷 |  |  | 應付  |
-
-付款：阿婷 → 小明 ・小陳 → 小明 ・小陳 → 小華 
-
----
-
-## 架構
-
-`
-app-config.js       (依前端網域選擇 master / dev API)
-index.html          (前端，可本機直接開啟或部署靜態站台)
-manifest.webmanifest、icons/（PWA 安裝資訊與各尺寸圖示）
-  │
-  │ HTTP (fetch)
-  ▼
-Google Apps Script  (免費 API，自動建立 Spreadsheet)
-  │
-  │ SpreadsheetApp
-  ▼
-Google Sheets       (資料庫，結構化儲存活動與品項資料)
-`
-
-### 環境與連線設定
-
-`master` 與 `dev` 共用同一份 `app-config.js`，依 `location.hostname` 自動選擇環境，因此切換或合併 branch 時不需要修改 API URL。
-
-| 環境 | 前端網址 | Apps Script API |
-| --- | --- | --- |
-| master | `https://trip-planner.tsai212224.workers.dev/` | `AKfycbyg...SZlzk/exec` |
-| dev | `https://test.tsai212224.workers.dev/` | `AKfycbxsv...XeR1iQ/exec` |
-
-本機的 `localhost`、`127.0.0.1` 以及未知網域一律使用 dev API，避免測試時誤寫正式資料。
-
-### Google Sheets 資料結構
-
-**activities 工作表（活動索引）**
-| activityId | name | members | createdAt | schedule | storageVersion |
-
-**items 工作表（所有活動的品項）**
-| activityId | itemId | name | claimers | payer | amount | sharers | updatedAt | amountSet |
-
----
-
-## 部署到靜態站台（可選）
-
-取得固定網址，方便分享：
-
-**Cloudflare Pages（推薦，免費）**
-1. 把 `index.html`、`app-config.js`、`manifest.webmanifest` 與 `icons` 資料夾上傳到 GitHub Repo
-2. 到 [pages.cloudflare.com](https://pages.cloudflare.com) 連結 Repo
-3. 部署後取得 xxx.pages.dev 網址
-
-**GitHub Pages（免費）**
-1. 在 GitHub 建立 Repo，上傳 `index.html`、`app-config.js`、`manifest.webmanifest` 與 `icons` 資料夾
-2. 到 Repo Settings → Pages → 選擇 Branch
-3. 部署後取得 username.github.io/reponame 網址
-
----
-
-## 注意事項
-
-- Apps Script 單次執行上限為 6 分鐘；實際可用量依 Google 帳號類型與每日配額而異。
-- 前端每 30 秒自動同步一次；一般小型群組足夠使用。
-- 多人同時編輯同一品項時，後寫者仍可能覆蓋先寫者，請避免同時修改同一欄位。
-- 資料集中在固定的 `activities`、`items` 兩張表，不會為每個活動建立新分頁。
-- API 是公開 Web App；僅適合受信任的朋友／小型社群，勿用來存放敏感資料。
+慾望、行程與記帳卡片都採整張卡片點擊；編輯與刪除集中放在詳情視窗內。彈窗使用獨立的內部捲動區，標題與底部操作按鈕不會跟著內容捲出卡片。

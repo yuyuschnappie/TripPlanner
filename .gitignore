@@ -25,3 +25,6 @@ Desktop.ini
 node_modules/
 dist/
 coverage/
+
+# 本機保存的舊版與未採用架構草稿，不參與旅遊版部署
+drafts/
