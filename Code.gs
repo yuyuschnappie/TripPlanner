@@ -11,7 +11,7 @@
 
 const SHEETS = Object.freeze({
   trips: ['code', 'name', 'members', 'currencies', 'createdAt', 'dates', 'rouletteEnabled'],
-  wishlist: ['tripCode', 'id', 'title', 'linkUrl', 'linkLabel', 'imageUrl', 'createdBy', 'position', 'updatedAt', 'details', 'links'],
+  wishlist: ['tripCode', 'id', 'title', 'linkUrl', 'linkLabel', 'imageUrl', 'createdBy', 'position', 'updatedAt', 'details', 'links', 'imageUrls'],
   itinerary: ['tripCode', 'id', 'date', 'time', 'title', 'location', 'linkUrl', 'updatedAt'],
   expenses: ['tripCode', 'id', 'title', 'payer', 'settlementCurrency', 'amounts', 'sharers', 'createdBy', 'position', 'updatedAt', 'date']
 });
@@ -109,17 +109,22 @@ class TravelService {
     if (request.mode === 'update' && !existing) throw new Error('找不到要編輯的慾望卡片，請重新整理後再試');
     const links = Model.links(request.links);
     const firstLink = links[0] || {url: Text.url(request.linkUrl), label: Text.optional(request.linkLabel, 60)};
+    const retainedImages = Model.imageUrls(Array.isArray(request.imageUrls) ? request.imageUrls : (existing && Array.isArray(existing.imageUrls) && existing.imageUrls.length ? existing.imageUrls : (request.imageUrl ? [request.imageUrl] : (existing && existing.imageUrl ? [existing.imageUrl] : []))));
+    const imageDataUrls = Array.isArray(request.imageDataUrls) ? request.imageDataUrls.filter(Boolean) : (request.imageDataUrl ? [request.imageDataUrl] : []);
+    if (retainedImages.length + imageDataUrls.length > 10) throw new Error('一張慾望卡最多可放 10 張照片');
+    const uploadedImages = imageDataUrls.map(dataUrl => this.uploadImage({dataUrl}).url);
+    const imageUrls = Model.imageUrls(retainedImages.concat(uploadedImages));
     const item = {
       tripCode: trip.code, id,
       title: Text.required(request.title, '請輸入標題', 160),
       linkUrl: firstLink.url || '',
       linkLabel: firstLink.label || '',
-      imageUrl: request.imageDataUrl ? this.uploadImage({dataUrl: request.imageDataUrl}).url : Text.optional(request.imageUrl, 500),
+      imageUrl: imageUrls[0] || '',
       createdBy: existing ? existing.createdBy : createdBy,
       position: existing ? existing.position : this.repository.findAll('wishlist', trip.code).length,
       updatedAt: new Date().toISOString(),
       details: Text.optional(request.details, 2000),
-      links
+      links, imageUrls
     };
     this.repository.upsert('wishlist', item);
     this.updateCachedCollection(trip.code, 'wishlist', item);
@@ -366,7 +371,7 @@ class TravelRepository {
     return this.rowCache[name];
   }
   parse(field, value) {
-    if (['members','currencies','amounts','sharers','dates','links'].includes(field)) { try { return JSON.parse(value || '[]'); } catch (ignored) { return []; } }
+    if (['members','currencies','amounts','sharers','dates','links','imageUrls'].includes(field)) { try { return JSON.parse(value || '[]'); } catch (ignored) { return []; } }
     if (field === 'rouletteEnabled') return value === true || String(value).toLowerCase() === 'true';
     if (field === 'position') return Number(value || 0);
     if (value instanceof Date) {
@@ -377,7 +382,7 @@ class TravelRepository {
     }
     return value;
   }
-  serialize(name, object) { return SHEETS[name].map(field => ['members','currencies','amounts','sharers','dates','links'].includes(field) ? JSON.stringify(object[field] || []) : object[field]); }
+  serialize(name, object) { return SHEETS[name].map(field => ['members','currencies','amounts','sharers','dates','links','imageUrls'].includes(field) ? JSON.stringify(object[field] || []) : object[field]); }
   append(name, row) {
     const sheet = this.sheet(name), rowNumber = sheet.getLastRow() + 1;
     if (name === 'itinerary') sheet.getRange(rowNumber, 3, 1, 2).setNumberFormat('@');
@@ -451,6 +456,11 @@ class Model {
     if (!Array.isArray(value)) return [];
     if (value.length > 10) throw new Error('一張慾望卡最多可設定 10 個連結');
     return value.map(item => ({url: Text.url(item && item.url), label: Text.optional(item && item.label, 60)})).filter(item => item.url);
+  }
+  static imageUrls(value) {
+    const result = [...new Set((Array.isArray(value) ? value : []).map(url => Text.url(url)).filter(Boolean))];
+    if (result.length > 10) throw new Error('一張慾望卡最多可放 10 張照片');
+    return result;
   }
 }
 
