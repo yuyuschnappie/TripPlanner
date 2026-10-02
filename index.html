@@ -21,6 +21,7 @@
     @keyframes fade  { from { opacity:0; } to { opacity:1; } }
     input[type=number]::-webkit-inner-spin-button,
     input[type=number]::-webkit-outer-spin-button { -webkit-appearance:none; margin:0; }
+    input[type=search]::-webkit-search-cancel-button { display:none; }
     ::-webkit-scrollbar { width:3px; }
     ::-webkit-scrollbar-thumb { background:#86efac; border-radius:2px; }
     body { overflow-x: hidden; }
@@ -134,7 +135,7 @@ const S = {
   apiUrl: DEV_SETTINGS ? localStorage.getItem('agy_trip_api') || DEFAULT_API_URL : DEFAULT_API_URL,
   actId:  new URLSearchParams(location.search).get('id'),
   act: null, user: null, tab: 'schedule', busy: false, syncing: 0,
-  expandedItem: null, editingItemName: null, autoRefreshTimer: null, scheduleDateDraft: null,
+  expandedItem: null, editingItemName: null, itemSearch: '', autoRefreshTimer: null, scheduleDateDraft: null,
   datePickerOpen: false, datePickerMonth: null,
   draft: { name:'', members:[], items:[] }
 };
@@ -629,8 +630,22 @@ function renderItems() {
 
   return `<div class="pt-3 pb-28">
   ${myItemsHtml}
+  <div class="mb-3">
+    <label for="item-search" class="sr-only">搜尋品項</label>
+    <div class="relative">
+      <span class="absolute inset-y-0 left-0 pl-3 flex items-center pointer-events-none text-gray-400" aria-hidden="true">
+        <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="m21 21-4.35-4.35m1.35-5.65a7 7 0 1 1-14 0 7 7 0 0 1 14 0Z"></path></svg>
+      </span>
+      <input id="item-search" type="search" value="${escapeHtml(S.itemSearch || '')}" placeholder="搜尋品項..." autocomplete="off"
+        class="w-full pl-9 pr-10 py-2.5 bg-white border border-gray-200 rounded-xl text-sm text-gray-700 shadow-sm focus:outline-none focus:border-green-400 focus:ring-2 focus:ring-green-100">
+      <button id="item-search-clear" type="button" aria-label="清除搜尋" title="清除搜尋"
+        class="${S.itemSearch ? '' : 'hidden '}absolute inset-y-0 right-0 px-3 text-gray-400 hover:text-gray-600 focus:outline-none focus-visible:ring-2 focus-visible:ring-green-400 rounded-r-xl">✕</button>
+    </div>
+    <p id="item-search-status" class="mt-1.5 px-1 text-xs text-gray-400" aria-live="polite"></p>
+  </div>
   ${statusBanner}
   <div id="item-list-container" class="space-y-1.5">${items.map(renderCard).join('')}</div>
+  <div id="item-search-empty" class="hidden py-10 text-center text-sm text-gray-400">找不到符合的品項</div>
   <div class="mt-4 flex gap-2 min-w-0">
     <input id="new-item" type="text" placeholder="＋ 新增品項..."
       class="flex-1 min-w-0 w-0 px-4 py-3 border-2 border-dashed border-gray-200 rounded-xl text-sm text-gray-500 focus:outline-none focus:border-green-400 bg-white/60">
@@ -687,7 +702,7 @@ function renderCard(it) {
       </div>
     </div>` : '';
 
-  return `<div class="bg-white rounded-xl p-2.5 shadow-sm border border-gray-100 transition-all ${isExp ? 'ring-2 ring-green-200' : ''}" data-item-id="${it.id}">
+  return `<div class="bg-white rounded-xl p-2.5 shadow-sm border border-gray-100 transition-all ${isExp ? 'ring-2 ring-green-200' : ''}" data-item-id="${it.id}" data-item-name="${escapeHtml(it.name)}">
   <div class="row-toggle flex items-center justify-between cursor-pointer select-none" data-id="${it.id}">
     <div class="flex items-center gap-2 flex-1 min-w-0 mr-2">
       <span class="drag-handle text-gray-300 hover:text-green-500 cursor-grab p-1 -ml-1 select-none flex-shrink-0" title="拖曳排序" aria-hidden="true">
@@ -948,6 +963,43 @@ document.querySelectorAll('.sch-time, .sch-location, .sch-title, .sch-location-u
   on('btn-add-item-a','click', doAddItem);
   on('new-item','keydown', e => { if(e.key==='Enter') doAddItem(); });
 
+  // 品項搜尋：直接切換既有卡片的顯示狀態，避免每輸入一個字就重繪而失去焦點。
+  let itemSortable = null;
+  const applyItemSearch = value => {
+    const query = String(value || '').trim().toLocaleLowerCase('zh-TW');
+    const cards = Array.from(document.querySelectorAll('#item-list-container > [data-item-id]'));
+    let visibleCount = 0;
+    cards.forEach(card => {
+      const matches = !query || String(card.dataset.itemName || '').toLocaleLowerCase('zh-TW').includes(query);
+      card.hidden = !matches;
+      if (matches) visibleCount++;
+    });
+
+    const empty = $e('item-search-empty');
+    if (empty) {
+      empty.classList.toggle('hidden', !query || visibleCount > 0);
+      if (query && visibleCount === 0) empty.textContent = `找不到符合「${String(value).trim()}」的品項`;
+    }
+    const status = $e('item-search-status');
+    if (status) status.textContent = query ? `顯示 ${visibleCount}／${cards.length} 個品項` : '';
+    const clearButton = $e('item-search-clear');
+    clearButton?.classList.toggle('hidden', !query);
+
+    // 有品項被隱藏時停用排序，避免拖曳後的畫面索引與完整清單不一致。
+    itemSortable?.option('disabled', Boolean(query));
+  };
+  on('item-search', 'input', e => {
+    S.itemSearch = e.currentTarget.value;
+    applyItemSearch(S.itemSearch);
+  });
+  on('item-search-clear', 'click', () => {
+    const input = $e('item-search');
+    S.itemSearch = '';
+    if (input) input.value = '';
+    applyItemSearch('');
+    input?.focus();
+  });
+
   // row toggle expand/collapse
 
   document.querySelectorAll('.my-item-link').forEach(btn => {
@@ -975,7 +1027,7 @@ document.querySelectorAll('.sch-time, .sch-location, .sch-title, .sch-location-u
   const itemList = $e('item-list-container');
   if (itemList && window.Sortable) {
     const useLongPressSorting = window.matchMedia?.('(pointer: coarse)').matches;
-    Sortable.create(itemList, {
+    itemSortable = Sortable.create(itemList, {
       animation: 150,
       // 手機可長按整列拖曳；滑鼠環境則維持使用左側排序把手。
       handle: useLongPressSorting ? '.row-toggle' : '.drag-handle',
@@ -1000,6 +1052,7 @@ document.querySelectorAll('.sch-time, .sch-location, .sch-title, .sch-location-u
       }
     });
   }
+  applyItemSearch(S.itemSearch);
 
   document.querySelectorAll('.row-toggle').forEach(el => {
     el.addEventListener('click', e => {
@@ -1186,7 +1239,7 @@ function bindChips() {
 
 function goHome() {
   S.page='home'; S.act=null; S.actId=null;
-  S.expandedItem=null; S.editingItemName=null; S.datePickerOpen=false;
+  S.expandedItem=null; S.editingItemName=null; S.itemSearch=''; S.datePickerOpen=false;
   history.pushState({},'',location.pathname); render();
 }
 
@@ -1194,7 +1247,7 @@ function openActivity(id) {
   id=String(id || '').trim();
   if(!id){toast('請輸入活動代碼','err');return;}
   if(!S.apiUrl){toast('請先設定 API URL','err');S.page='setup';render();return;}
-  S.actId=id; S.user=localStorage.getItem('agy_user_'+id)||null; S.act=null;
+  S.actId=id; S.user=localStorage.getItem('agy_user_'+id)||null; S.act=null; S.itemSearch='';
   const url=new URL(location.href); url.searchParams.set('id',id); history.pushState({},'',url.toString());
   S.page='activity'; S.tab='items'; loadAct(id);
 }
