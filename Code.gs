@@ -13,7 +13,7 @@ const SHEETS = Object.freeze({
   trips: ['code', 'name', 'members', 'currencies', 'createdAt', 'dates', 'rouletteEnabled'],
   wishlist: ['tripCode', 'id', 'title', 'linkUrl', 'linkLabel', 'imageUrl', 'createdBy', 'position', 'updatedAt', 'details', 'links', 'imageUrls'],
   itinerary: ['tripCode', 'id', 'date', 'time', 'title', 'location', 'linkUrl', 'updatedAt'],
-  expenses: ['tripCode', 'id', 'title', 'payer', 'settlementCurrency', 'amounts', 'sharers', 'createdBy', 'position', 'updatedAt', 'date']
+  expenses: ['tripCode', 'id', 'title', 'payer', 'settlementCurrency', 'amounts', 'sharers', 'createdBy', 'position', 'updatedAt', 'date', 'prepayments']
 });
 
 function doGet(e) {
@@ -188,12 +188,15 @@ class TravelService {
     const amounts = Model.amounts(request.amounts, trip.currencies);
     const settlementCurrency = amounts.length === 1 ? amounts[0].currencyCode : String(request.settlementCurrency || '').toUpperCase();
     if (!amounts.some(amount => amount.currencyCode === settlementCurrency)) throw new Error('必須填寫所選結算幣別的金額');
+    const settlementAmount = amounts.find(amount => amount.currencyCode === settlementCurrency).amount;
+    const prepayments = Model.prepayments(request.prepayments, sharers, settlementAmount);
     const item = {
       tripCode: trip.code, id, title: Text.required(request.title, '請輸入記帳名稱', 160), payer,
       settlementCurrency, amounts, sharers, createdBy: existing ? existing.createdBy : createdBy,
       position: existing ? existing.position : this.repository.findAll('expenses', trip.code).length,
       updatedAt: new Date().toISOString(),
-      date: /^\d{4}-\d{2}-\d{2}$/.test(String(request.date || '')) ? request.date : Utilities.formatDate(new Date(), 'Asia/Taipei', 'yyyy-MM-dd')
+      date: /^\d{4}-\d{2}-\d{2}$/.test(String(request.date || '')) ? request.date : Utilities.formatDate(new Date(), 'Asia/Taipei', 'yyyy-MM-dd'),
+      prepayments
     };
     this.repository.upsert('expenses', item);
     this.updateCachedCollection(trip.code, 'expenses', item);
@@ -315,15 +318,27 @@ class SettlementService {
       if (!selected.length) return null;
       const paid = Object.fromEntries(trip.members.map(member => [member, 0]));
       const balance = Object.fromEntries(trip.members.map(member => [member, 0]));
-      let total = 0;
+      const personalCost = Object.fromEntries(trip.members.map(member => [member, 0]));
+      let total = 0, prepaidTotal = 0;
       selected.forEach(expense => {
         const money = expense.amounts.find(amount => amount.currencyCode === currency.code);
         if (!money) throw new Error(expense.title + ' 缺少結算幣別金額');
         const factor = Math.pow(10, currency.decimalPlaces);
-        const amount = Math.ceil(Number(money.amount) * factor);
+        const amount = Math.round(Number(money.amount) * factor);
         paid[expense.payer] += amount; balance[expense.payer] += amount; total += amount;
         const base = Math.floor(amount / expense.sharers.length), remainder = amount % expense.sharers.length;
-        expense.sharers.forEach((member, index) => balance[member] -= base + (index < remainder ? 1 : 0));
+        expense.sharers.forEach((member, index) => {
+          const share = base + (index < remainder ? 1 : 0);
+          balance[member] -= share;
+          personalCost[member] += share;
+        });
+        (Array.isArray(expense.prepayments) ? expense.prepayments : []).forEach(prepayment => {
+          const prepaid = Math.round(Number(prepayment.amount) * factor);
+          if (!prepaid || !Object.prototype.hasOwnProperty.call(balance, prepayment.member)) return;
+          balance[expense.payer] -= prepaid;
+          balance[prepayment.member] += prepaid;
+          prepaidTotal += prepaid;
+        });
       });
       const creditors = trip.members.filter(m => balance[m] > 0).map(m => ({name:m, amount:balance[m]})).sort((a,b) => b.amount-a.amount);
       const debtors = trip.members.filter(m => balance[m] < 0).map(m => ({name:m, amount:-balance[m]})).sort((a,b) => b.amount-a.amount);
@@ -334,8 +349,10 @@ class SettlementService {
         creditors[ci].amount -= amount; debtors[di].amount -= amount;
         if (!creditors[ci].amount) ci++; if (!debtors[di].amount) di++;
       }
-      return {currency, total: total / Math.pow(10, currency.decimalPlaces), transfers,
-        personalCost: Object.fromEntries(trip.members.map(member => [member, (paid[member] - balance[member]) / Math.pow(10, currency.decimalPlaces)]))};
+      const factor = Math.pow(10, currency.decimalPlaces);
+      return {currency, total: total / factor, prepaidTotal: prepaidTotal / factor,
+        unsettledTotal: Math.max(0, total - prepaidTotal) / factor, transfers,
+        personalCost: Object.fromEntries(trip.members.map(member => [member, personalCost[member] / factor]))};
     }).filter(Boolean);
   }
 }
@@ -371,7 +388,7 @@ class TravelRepository {
     return this.rowCache[name];
   }
   parse(field, value) {
-    if (['members','currencies','amounts','sharers','dates','links','imageUrls'].includes(field)) { try { return JSON.parse(value || '[]'); } catch (ignored) { return []; } }
+    if (['members','currencies','amounts','sharers','dates','links','imageUrls','prepayments'].includes(field)) { try { return JSON.parse(value || '[]'); } catch (ignored) { return []; } }
     if (field === 'rouletteEnabled') return value === true || String(value).toLowerCase() === 'true';
     if (field === 'position') return Number(value || 0);
     if (value instanceof Date) {
@@ -382,7 +399,7 @@ class TravelRepository {
     }
     return value;
   }
-  serialize(name, object) { return SHEETS[name].map(field => ['members','currencies','amounts','sharers','dates','links','imageUrls'].includes(field) ? JSON.stringify(object[field] || []) : object[field]); }
+  serialize(name, object) { return SHEETS[name].map(field => ['members','currencies','amounts','sharers','dates','links','imageUrls','prepayments'].includes(field) ? JSON.stringify(object[field] || []) : object[field]); }
   append(name, row) {
     const sheet = this.sheet(name), rowNumber = sheet.getLastRow() + 1;
     if (name === 'itinerary') sheet.getRange(rowNumber, 3, 1, 2).setNumberFormat('@');
@@ -445,6 +462,13 @@ class Model {
     const supported = currencies.map(currency => currency.code);
     const result = (Array.isArray(value) ? value : []).filter(item => item.amount !== '' && item.amount != null).map(item => ({currencyCode: String(item.currencyCode || '').toUpperCase(), amount: Number(item.amount)}));
     if (!result.length || result.some(item => !supported.includes(item.currencyCode) || !Number.isFinite(item.amount) || item.amount <= 0) || new Set(result.map(item => item.currencyCode)).size !== result.length) throw new Error('請正確填寫至少一筆幣別金額');
+    return result;
+  }
+  static prepayments(value, sharers, settlementAmount) {
+    const result = (Array.isArray(value) ? value : []).filter(item => item && item.amount !== '' && item.amount != null && Number(item.amount) !== 0).map(item => ({member: String(item.member || '').trim(), amount: Number(item.amount)}));
+    if (result.some(item => !sharers.includes(item.member) || !Number.isFinite(item.amount) || item.amount < 0) || new Set(result.map(item => item.member)).size !== result.length) throw new Error('請正確填寫各分攤人的已支付金額');
+    const total = result.reduce((sum, item) => sum + item.amount, 0);
+    if (total > Number(settlementAmount) + 1e-8) throw new Error('已支付總額不可超過此筆費用');
     return result;
   }
   static dates(value) {
